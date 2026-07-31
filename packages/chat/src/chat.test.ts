@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const ANY_REGEX = /.*/;
 const HELP_REGEX = /help/i;
 const HELLO_REGEX = /hello/i;
 
@@ -604,6 +605,47 @@ describe("Chat", () => {
       expect(handler).toHaveBeenCalled();
       const [, receivedMessage] = handler.mock.calls[0];
       expect(receivedMessage.isMention).toBe(false);
+    });
+
+    it.each([
+      ["jane@slack-bot.com", "an email whose domain starts with the bot name"],
+      ["foo.bar@slack-bot.com", "a dotted email local part"],
+      ["foo-bar@slack-bot.com", "a hyphenated email local part"],
+      ["https://user@slack-bot.com", "url userinfo"],
+    ])("should not treat %s as a mention (%s)", async (text) => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      chat.onNewMessage(ANY_REGEX, handler);
+
+      await chat.handleIncomingMessage(
+        mockAdapter,
+        "slack:C123:1234.5678",
+        createTestMessage("msg-1", text)
+      );
+
+      expect(handler).toHaveBeenCalled();
+      const [, receivedMessage] = handler.mock.calls[0];
+      expect(receivedMessage.isMention).toBe(false);
+    });
+
+    it.each([
+      ["@slack-bot help", "at the start"],
+      ["hey @slack-bot", "after a space"],
+      ["(@slack-bot)", "wrapped in parentheses"],
+      ["cc:@slack-bot", "after a colon"],
+      ["wait...@slack-bot", "after an ellipsis"],
+    ])("should still detect %s as a mention (%s)", async (text) => {
+      const handler = vi.fn().mockResolvedValue(undefined);
+      chat.onNewMention(handler);
+
+      await chat.handleIncomingMessage(
+        mockAdapter,
+        "slack:C123:1234.5678",
+        createTestMessage("msg-1", text)
+      );
+
+      expect(handler).toHaveBeenCalled();
+      const [, receivedMessage] = handler.mock.calls[0];
+      expect(receivedMessage.isMention).toBe(true);
     });
 
     it("should set isMention=true in subscribed thread when mentioned", async () => {
