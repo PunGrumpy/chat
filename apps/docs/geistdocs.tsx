@@ -4,7 +4,7 @@ import type {
 } from "@vercel/geistdocs/config";
 import { LogoChatSdk } from "@vercel/geistdocs/assets/logos/logo-chat-sdk";
 
-export const Logo = () => <LogoChatSdk height={22} />;
+export const Logo = () => <LogoChatSdk />;
 
 export const github: GeistdocsGithubConfig = {
   branch: "main",

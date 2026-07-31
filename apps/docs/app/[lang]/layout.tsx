@@ -1,6 +1,8 @@
 import "../global.css";
+import { Analytics } from "@vercel/analytics/next";
 import { Footer } from "@vercel/geistdocs/footer";
 import { Navbar } from "@vercel/geistdocs/navbar";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 import type { Metadata } from "next";
 import { GeistdocsProvider } from "@/components/geistdocs/provider";
 import { config } from "@/lib/geistdocs/config";
@@ -40,6 +42,8 @@ const Layout = async ({ children, params }: LayoutProps<"/[lang]">) => {
           {children}
           <Footer />
         </GeistdocsProvider>
+        <Analytics />
+        <SpeedInsights />
       </body>
     </html>
   );
