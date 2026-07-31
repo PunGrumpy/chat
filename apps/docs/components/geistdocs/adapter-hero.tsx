@@ -60,7 +60,7 @@ export const AdapterHero = ({ logo, name, tagline }: AdapterHeroProps) => {
             <Icon className="size-8" />
           </span>
         ) : null}
-        <h1 className="min-w-0 flex-1 font-semibold text-[34px] leading-[1.1] tracking-tight">
+        <h1 className="min-w-0 flex-1 text-heading-32">
           {name}
         </h1>
       </div>
