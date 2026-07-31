@@ -10,6 +10,7 @@ import {
 import type { IStreamer } from "@microsoft/teams.apps";
 import { ConsoleLogger, getEmoji } from "chat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TeamsActivityAttachment } from "./attachments";
 import { createTeamsAdapter, TeamsAdapter, type TeamsThreadId } from "./index";
 
 const WHITESPACE_START_PATTERN = /^\s/;
@@ -33,6 +34,40 @@ class MockTeamsError extends Error {
 }
 
 const logger = new ConsoleLogger("error");
+const TEST_SERVICE_URL = "https://smba.trafficmanager.net/teams/";
+
+class AttachmentTestAdapter extends TeamsAdapter {
+  createTestAttachment(
+    attachment: TeamsActivityAttachment,
+    serviceUrl?: string
+  ) {
+    return this.createAttachment(attachment, serviceUrl);
+  }
+}
+
+function createAttachmentTestAdapter(): AttachmentTestAdapter {
+  return new AttachmentTestAdapter({
+    appId: "test-app",
+    appPassword: "test",
+    logger,
+  });
+}
+
+function setAuthenticatedAttachmentGet(
+  adapter: TeamsAdapter,
+  get: ReturnType<typeof vi.fn>
+): void {
+  const app = (
+    adapter as unknown as {
+      app: {
+        api: {
+          http: { get: typeof get };
+        };
+      };
+    }
+  ).app;
+  app.api.http.get = get;
+}
 
 // encodeThreadId/decodeThreadId/isDM are pure — a minimally configured adapter
 // suffices for the shared thread-id contract (no init/network needed).
@@ -193,6 +228,7 @@ describe("TeamsAdapter", () => {
 
   afterEach(() => {
     process.env = { ...savedEnv };
+    vi.unstubAllGlobals();
   });
 
   it("should export createTeamsAdapter function", () => {
@@ -734,6 +770,70 @@ describe("TeamsAdapter", () => {
       expect(message.attachments[1].type).toBe("video");
       expect(message.attachments[2].type).toBe("audio");
       expect(message.attachments[3].type).toBe("file");
+    });
+
+    it("authenticates trusted inline attachment downloads", async () => {
+      const adapter = createAttachmentTestAdapter();
+      const authenticatedGet = vi.fn(async () => ({
+        data: new TextEncoder().encode("protected image").buffer,
+      }));
+      setAuthenticatedAttachmentGet(adapter, authenticatedGet);
+      const anonymousFetch = vi.fn();
+      vi.stubGlobal("fetch", anonymousFetch);
+      const url =
+        "https://smba.trafficmanager.net/teams/v3/attachments/image/views/original";
+
+      const attachment = adapter.createTestAttachment(
+        {
+          contentType: "image/png",
+          contentUrl: url,
+          name: "screenshot.png",
+        },
+        TEST_SERVICE_URL
+      );
+
+      expect(attachment.fetchMetadata).toEqual({
+        url,
+        auth: "bot",
+        connectorOrigin: "https://smba.trafficmanager.net",
+      });
+      await expect(attachment.fetchData?.()).resolves.toEqual(
+        Buffer.from("protected image")
+      );
+      expect(authenticatedGet).toHaveBeenCalledWith(url, {
+        maxRedirects: 0,
+        responseType: "arraybuffer",
+      });
+      expect(anonymousFetch).not.toHaveBeenCalled();
+    });
+
+    it("preserves anonymous fetch overrides during rehydration", async () => {
+      const overriddenFetch = vi.fn(async () => Buffer.from("overridden"));
+
+      class CustomTeamsAdapter extends TeamsAdapter {
+        protected override createFetchDataFn(
+          url: string
+        ): () => Promise<Buffer> {
+          expect(url).toBe("https://files.example.com/report.pdf");
+          return overriddenFetch;
+        }
+      }
+
+      const adapter = new CustomTeamsAdapter({
+        appId: "test-app",
+        appPassword: "test",
+        logger,
+      });
+      const attachment = adapter.rehydrateAttachment({
+        type: "file",
+        url: "https://files.example.com/report.pdf",
+        fetchMetadata: { url: "https://files.example.com/report.pdf" },
+      });
+
+      await expect(attachment.fetchData?.()).resolves.toEqual(
+        Buffer.from("overridden")
+      );
+      expect(overriddenFetch).toHaveBeenCalledOnce();
     });
 
     it("should set metadata.edited to false for new messages", () => {
