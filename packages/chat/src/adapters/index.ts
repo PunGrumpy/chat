@@ -111,6 +111,12 @@ export interface CatalogAdapter {
    */
   group: "official" | "vendor-official";
   /**
+   * Module specifier the factory is imported from, when the adapter ships on
+   * a subpath of {@link CatalogAdapter.packageName}. The package to install is
+   * still `packageName`. Defaults to `packageName` when omitted.
+   */
+  importPath?: string;
+  /**
    * Display name.
    */
   name: string;
@@ -1091,6 +1097,53 @@ export const ADAPTERS = {
     packageName: "@chat-adapter/x",
     peerDeps: [],
     slug: "x",
+    type: "platform",
+  },
+  xchat: {
+    description:
+      "Hold encrypted 1:1 and group conversations on XChat with all cryptography handled inside the adapter.",
+    env: {
+      optional: [
+        secretEnv(
+          "X_CONSUMER_SECRET",
+          "App consumer secret for webhook CRC and signature verification. Required to receive webhooks: incoming POSTs are rejected when omitted. Polling deployments do not need it."
+        ),
+        env(
+          "X_DISABLE_WEBHOOK_VERIFICATION",
+          "Set to true to accept webhook POSTs without verifying their signature. Not recommended in production."
+        ),
+        env(
+          "X_BOT_USERNAME",
+          "Bot account handle used for mention detection. Resolved from /2/users/me when omitted."
+        ),
+        env(
+          "X_VERIFY_SIGNATURES",
+          "Set to false to accept messages without verifiable signatures. Defaults to true."
+        ),
+        env(
+          "X_SIGNING_KEY_VERSION",
+          "Signing key version override. Fetched from the X API when omitted."
+        ),
+      ],
+      required: [
+        secretEnv(
+          "XCHAT_BOT_TOKEN",
+          "OAuth 2.0 user access token for the bot account.",
+          { aliases: ["X_ACCESS_TOKEN"] }
+        ),
+        secretEnv(
+          "XCHAT_PIN",
+          "Juicebox PIN used to unlock the bot's private keys at startup."
+        ),
+      ],
+    },
+    factoryExport: "createXchatAdapter",
+    group: "official",
+    importPath: "@chat-adapter/x/chat",
+    name: "XChat",
+    packageName: "@chat-adapter/x",
+    peerDeps: ["@xdevplatform/chat-xdk", "@xdevplatform/xdk", "juicebox-sdk"],
+    slug: "xchat",
     type: "platform",
   },
   zernio: {
