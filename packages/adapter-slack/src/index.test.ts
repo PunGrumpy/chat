@@ -4964,6 +4964,121 @@ describe("agent_view DM threading", () => {
 });
 
 // ============================================================================
+// threadDirectMessages Tests
+// ============================================================================
+
+describe("threadDirectMessages", () => {
+  const secret = "test-secret";
+
+  function dmBody(threadTs?: string) {
+    return JSON.stringify({
+      type: "event_callback",
+      event: {
+        type: "message",
+        channel: "D1",
+        channel_type: "im",
+        user: "U1",
+        text: "hi",
+        ts: "1771.99",
+        event_ts: "1771.99",
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+      },
+    });
+  }
+
+  async function routeDM(
+    adapter: SlackAdapter,
+    mockChat: ReturnType<typeof createMockChatInstance>,
+    body: string
+  ) {
+    await adapter.initialize(mockChat);
+    const tasks: Promise<unknown>[] = [];
+    await adapter.handleWebhook(createWebhookRequest(body, secret), {
+      waitUntil: (p) => {
+        tasks.push(p);
+      },
+    });
+    await Promise.all(tasks);
+    return vi.mocked(mockChat.processMessage).mock.calls[0]?.[1];
+  }
+
+  it("threads a top-level DM message under its own ts", async () => {
+    const adapter = createSlackAdapter({
+      threadDirectMessages: true,
+      signingSecret: secret,
+      botUserId: "U_BOT",
+      logger: mockLogger,
+    });
+    const mockChat = createMockChatInstance({ state: createMockState() });
+
+    expect(await routeDM(adapter, mockChat, dmBody())).toBe("slack:D1:1771.99");
+  });
+
+  it("keeps DM replies on the parent thread_ts", async () => {
+    const adapter = createSlackAdapter({
+      threadDirectMessages: true,
+      signingSecret: secret,
+      botUserId: "U_BOT",
+      logger: mockLogger,
+    });
+    const mockChat = createMockChatInstance({ state: createMockState() });
+
+    expect(await routeDM(adapter, mockChat, dmBody("1771.11"))).toBe(
+      "slack:D1:1771.11"
+    );
+  });
+
+  it("routes to the conversation-scoped thread when it is subscribed (openDM flow)", async () => {
+    const adapter = createSlackAdapter({
+      threadDirectMessages: true,
+      signingSecret: secret,
+      botUserId: "U_BOT",
+      logger: mockLogger,
+    });
+    const state = createMockState();
+    await state.subscribe("slack:D1:");
+    const mockChat = createMockChatInstance({ state });
+
+    expect(await routeDM(adapter, mockChat, dmBody())).toBe("slack:D1:");
+  });
+
+  it("keeps DMs conversation-scoped when unset", async () => {
+    const adapter = createSlackAdapter({
+      signingSecret: secret,
+      botUserId: "U_BOT",
+      logger: mockLogger,
+    });
+    const mockChat = createMockChatInstance({ state: createMockState() });
+
+    expect(await routeDM(adapter, mockChat, dmBody())).toBe("slack:D1:");
+  });
+
+  it("leaves channel threading unchanged", async () => {
+    const adapter = createSlackAdapter({
+      threadDirectMessages: true,
+      signingSecret: secret,
+      botUserId: "U_BOT",
+      logger: mockLogger,
+    });
+    const mockChat = createMockChatInstance({ state: createMockState() });
+    const body = JSON.stringify({
+      type: "event_callback",
+      event: {
+        type: "message",
+        channel: "C1",
+        channel_type: "channel",
+        user: "U1",
+        text: "hi",
+        ts: "1771.99",
+        event_ts: "1771.99",
+      },
+    });
+
+    expect(await routeDM(adapter, mockChat, body)).toBe("slack:C1:1771.99");
+  });
+});
+
+// ============================================================================
 // Typing Indicator Tests
 // ============================================================================
 
