@@ -140,6 +140,12 @@ bot.onNewMention(async (thread, message) => {
       description:
         "Enable the Agent messaging experience (agent_view manifest mode).",
     },
+    threadDirectMessages: {
+      type: "boolean",
+      default: "false",
+      description:
+        "Reply in a thread when a user DMs the bot, so each top-level DM starts its own conversation. Implied by agentView.",
+    },
     suggestedPrompts: {
       type: "SlackSuggestedPrompts",
       description:
@@ -276,6 +282,26 @@ The `@chat-adapter/slack/webhook`, `@chat-adapter/slack/format`, `@chat-adapter/
 
 ## Advanced
 
+### Threaded DMs
+
+By default a DM with your bot is one flat conversation: every message and every reply lands at the top level. Set `threadDirectMessages` to reply in a thread instead, so each top-level DM starts its own conversation:
+
+```typescript
+const slack = createSlackAdapter({ threadDirectMessages: true });
+```
+
+Each message the user sends at the DM top level becomes a thread root and the bot replies inside it. Users get one scoped conversation per topic instead of an unbounded transcript, and follow-ups stay attached to the message they belong to.
+
+It also gives DMs the `thread_ts` that Slack's [native streaming API](#native-streaming) requires, so streamed replies render natively in DMs rather than falling back to post-and-edit.
+
+<Callout type="warn">
+Because bot replies are threaded under each user message, channel-level history (`channel.messages`, `conversations.history`) only returns the user's side of a DM conversation. If you build AI conversation history for DMs, use [transcripts](/docs/conversation-history) (which record both roles across thread IDs) instead of channel history, otherwise the model never sees its own previous replies.
+</Callout>
+
+Thread IDs change from `slack:{channelId}:` to `slack:{channelId}:{ts}`, so turning this on for a running bot starts fresh threads and state stored against the old conversation-scoped ID stays there. Subscriptions are bridged: when the conversation-scoped thread returned by `openDM()` is subscribed, top-level DM messages still route to it, so `onSubscribedMessage` and proactive flows keep working.
+
+[`agentView`](#agent-messaging-experience) already threads DMs, so agents do not need to set this.
+
 ### Agents
 
 Everything for building an AI agent on Slack: the Agent messaging experience (`agent_view`), the Assistants API (suggested prompts, status, titles), native streaming, and feedback buttons.
@@ -294,11 +320,7 @@ With `agentView: true`:
 - `onAppContextChanged` reports the user's active view (see [Handling active-view context](/docs/handling-events#handling-active-view-context-agent-messaging)).
 - `getAppContext(message)` returns the folded active-view context on a DM message.
 - `setSuggestedPrompts(channelId, undefined, prompts)` may omit the thread reference — prompts sit at the top of the agent conversation. A `suggestedPrompts` config entry is applied automatically on every Messages-tab open.
-- DM messages are threaded per Slack's model (each user message is a thread root). Threads returned by `openDM()` keep working: when the conversation-scoped thread is subscribed, incoming top-level DM messages route to it, so `onSubscribedMessage` and per-thread state behave as before.
-
-<Callout type="warn">
-Because bot replies are threaded under each user message, channel-level history (`channel.messages`, `conversations.history`) only returns the user's side of a DM conversation. If you build AI conversation history for DMs, use [transcripts](/docs/conversation-history) (which record both roles across thread IDs) instead of channel history — otherwise the model never sees its own previous replies.
-</Callout>
+- DM messages are threaded per Slack's model (each user message is a thread root). See [Threaded DMs](#threaded-dms) for how thread IDs, subscriptions, and conversation history behave.
 
 Add the event subscription and scope to your manifest:
 
