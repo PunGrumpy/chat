@@ -631,6 +631,8 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
   // Socket mode support
   protected readonly appToken: string | undefined;
   protected readonly agentView: boolean;
+  /** True when top-level DMs are routed to their own thread root. */
+  protected readonly dmThreading: boolean;
   protected readonly suggestedPrompts?: SlackSuggestedPrompts;
   protected readonly loadingMessages?: string[];
   /** Normalized feedbackButtons config (`true` becomes `{}`). */
@@ -811,6 +813,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
 
     this.appToken = config.appToken;
     this.agentView = config.agentView ?? false;
+    this.dmThreading = this.agentView || (config.threadDirectMessages ?? false);
     this.suggestedPrompts = config.suggestedPrompts;
     this.loadingMessages = config.loadingMessages;
     this.nativeStreaming = config.nativeStreaming ?? true;
@@ -2611,16 +2614,17 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       return;
     }
 
-    // For DMs under assistant_view (legacy): top-level messages use empty threadTs
-    // (matches openDM subscriptions); thread replies use thread_ts for per-conversation
-    // isolation.
-    // Under agent_view the Messages-tab conversation is threaded per Slack's model —
-    // each user message is a thread root — so reply in-thread using `thread_ts ?? ts`
-    // (except when the conversation-scoped openDM ID is subscribed; see bridge below).
+    // For DMs by default (and under assistant_view, legacy): top-level messages use
+    // empty threadTs (matches openDM subscriptions); thread replies use thread_ts for
+    // per-conversation isolation.
+    // Under agent_view or threadDirectMessages the DM conversation is threaded per
+    // Slack's model, each user message being a thread root, so reply in-thread using
+    // `thread_ts ?? ts` (except when the conversation-scoped openDM ID is subscribed;
+    // see bridge below).
     // For channels: always use thread_ts or ts for per-thread IDs.
     const isDM = event.channel_type === "im";
     const threadTs =
-      isDM && !this.agentView
+      isDM && !this.dmThreading
         ? event.thread_ts || ""
         : event.thread_ts || event.ts;
     const threadId = this.encodeThreadId({
@@ -2646,12 +2650,12 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       return msg;
     };
 
-    // Under agent_view each top-level DM message is its own thread root, which
-    // would silently bypass subscriptions created on the conversation-scoped
+    // With DM threading on, each top-level DM message is its own thread root,
+    // which would silently bypass subscriptions created on the conversation-scoped
     // thread ID that openDM() returns (slack:{D…}:). Bridge: when that
     // conversation-scoped ID is subscribed, route the message to it so
     // onSubscribedMessage and per-thread state keep working for proactive flows.
-    if (this.agentView && isDM && !event.thread_ts) {
+    if (this.dmThreading && isDM && !event.thread_ts) {
       const chat = this.chat;
       const conversationThreadId = this.encodeThreadId({
         channel: event.channel,
@@ -2665,7 +2669,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
           }
         } catch (error) {
           this.logger.warn(
-            "agent_view DM subscription check failed; using per-message thread",
+            "DM subscription check failed; using per-message thread",
             { error: String(error), threadId }
           );
         }
@@ -5832,6 +5836,7 @@ export function createSlackAdapter(config?: SlackAdapterConfig): SlackAdapter {
     logger: config?.logger ?? new ConsoleLogger("info").child("slack"),
     nativeStreaming: config?.nativeStreaming,
     suggestedPrompts: config?.suggestedPrompts,
+    threadDirectMessages: config?.threadDirectMessages,
     socketForwardingSecret:
       config?.socketForwardingSecret ??
       process.env.SLACK_SOCKET_FORWARDING_SECRET,

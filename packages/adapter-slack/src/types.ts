@@ -178,6 +178,19 @@ export interface SlackAdapterConfig {
    * active-view entities) and returns prompts per thread.
    */
   suggestedPrompts?: SlackSuggestedPrompts;
+  /**
+   * Reply in a thread when a user DMs the bot, so each top-level DM starts its
+   * own conversation instead of one flat, unbounded transcript. Also gives DMs
+   * the `thread_ts` that Slack's native streaming API requires.
+   *
+   * Thread IDs become `slack:{D…}:{ts}` rather than `slack:{D…}:`, so enabling
+   * this on a running bot starts fresh threads: existing per-thread state stays
+   * on the old ID. Subscriptions created by `openDM()` keep working: a
+   * subscribed conversation-scoped thread still receives every DM.
+   *
+   * Implied by `agentView`. Defaults to false.
+   */
+  threadDirectMessages?: boolean;
   /** Override bot username (optional) */
   userName?: string;
   /**
