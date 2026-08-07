@@ -1351,7 +1351,7 @@ describe("postMessage - file uploads", () => {
     ).toBe("Remote image card");
   });
 
-  it("card with text fallback and file does not send duplicate text", async () => {
+  it("card with single link button and file sends one captioned media message", async () => {
     const adapter = createTestAdapter();
     const card: CardElement = {
       type: "card",
@@ -1381,14 +1381,17 @@ describe("postMessage - file uploads", () => {
       ],
     });
 
+    // Media posts keep the pre-existing single captioned send; the
+    // caption carries the link URL instead of a second cta_url message.
     expect(getMediaCalls()).toHaveLength(1);
     expect(getMessageCalls()).toHaveLength(1);
 
     const mediaMessage = parseMessageBody(0);
+
     expect(mediaMessage.type).toBe("image");
-    expect((mediaMessage.image as { caption: string }).caption).toContain(
-      "Order update"
-    );
+    const caption = (mediaMessage.image as { caption?: string }).caption;
+    expect(caption).toContain("Order update");
+    expect(caption).toContain("Track: https://example.com/track");
   });
 
   it("text-fallback card + file puts title and body only in the caption once", async () => {
@@ -1409,6 +1412,11 @@ describe("postMessage - file uploads", () => {
                 type: "link-button",
                 url: "https://example.com/receipt",
                 label: "View",
+              },
+              {
+                type: "link-button",
+                url: "https://example.com/help",
+                label: "Help",
               },
             ],
           },
@@ -1432,6 +1440,62 @@ describe("postMessage - file uploads", () => {
     expect(caption).toContain(bodyLine);
     expect(caption.split(title).length - 1).toBe(1);
     expect(caption.split(bodyLine).length - 1).toBe(1);
+    expect(caption).toContain("View: https://example.com/receipt");
+    expect(caption).toContain("Help: https://example.com/help");
+  });
+
+  it("single link-button card posts CTA URL interactive payload", async () => {
+    const adapter = createTestAdapter();
+
+    await adapter.postMessage(THREAD_ID, {
+      card: {
+        type: "card",
+        title: "See dates",
+        children: [
+          {
+            type: "text",
+            content: "Tap the button below to see available dates.",
+          },
+          {
+            type: "actions",
+            children: [
+              {
+                type: "link-button",
+                url: "https://example.com/dates",
+                label: "See Dates",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(getMessageCalls()).toHaveLength(1);
+    const message = parseMessageBody(0);
+    expect(message.type).toBe("interactive");
+
+    const interactive = message.interactive as {
+      type: string;
+      header?: { type: string; text: string };
+      body: { text: string };
+      action: {
+        name: string;
+        parameters: { display_text: string; url: string };
+      };
+    };
+
+    expect(interactive.type).toBe("cta_url");
+    expect(interactive.header).toEqual({ type: "text", text: "See dates" });
+    expect(interactive.body.text).toContain(
+      "Tap the button below to see available dates."
+    );
+    expect(interactive.action).toEqual({
+      name: "cta_url",
+      parameters: {
+        display_text: "See Dates",
+        url: "https://example.com/dates",
+      },
+    });
   });
 
   it("oversize image throws ValidationError before upload", async () => {
