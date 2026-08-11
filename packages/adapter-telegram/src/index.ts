@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import {
   AdapterRateLimitError,
   AuthenticationError,
@@ -121,6 +121,7 @@ const TELEGRAM_INCOMING_MEDIA_GROUP_BUFFER_TTL_MS = 30_000;
 const TELEGRAM_INCOMING_MEDIA_GROUP_LOCK_TTL_MS = 5_000;
 const TELEGRAM_INCOMING_MEDIA_GROUP_RETRY_MS = 50;
 const TELEGRAM_INCOMING_MEDIA_GROUP_SETTLE_MS = 1_000;
+const TELEGRAM_WEBHOOK_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 const TELEGRAM_MEDIA_GROUP_MIN = 2;
 const TELEGRAM_MEDIA_GROUP_MAX = 10;
 const TELEGRAM_MARKDOWN_PARSE_ERROR_PATTERN =
@@ -265,6 +266,7 @@ export class TelegramAdapter
   protected readonly botToken: string;
   protected readonly apiBaseUrl: string;
   protected readonly secretToken?: string;
+  private readonly webhookScope: string;
   private warnedNoVerification = false;
   protected readonly logger: Logger;
   protected readonly formatConverter = new TelegramFormatConverter();
@@ -314,6 +316,7 @@ export class TelegramAdapter
     }
 
     this.botToken = botToken;
+    this.webhookScope = createHash("sha256").update(botToken).digest("hex");
     this.apiBaseUrl = trimTrailingSlashes(
       config.apiUrl ??
         config.apiBaseUrl ??
@@ -461,6 +464,30 @@ export class TelegramAdapter
         "Chat instance not initialized, ignoring Telegram webhook"
       );
       return new Response("OK", { status: 200 });
+    }
+
+    if (this.secretToken && Number.isInteger(update.update_id)) {
+      try {
+        const claimed = await this.chat
+          .getState()
+          .setIfNotExists(
+            `${this.name}:webhook-update:${this.webhookScope}:${update.update_id}`,
+            true,
+            TELEGRAM_WEBHOOK_UPDATE_TTL_MS
+          );
+        if (!claimed) {
+          this.logger.debug("Ignoring duplicate Telegram webhook update", {
+            updateId: update.update_id,
+          });
+          return new Response("OK", { status: 200 });
+        }
+      } catch (error) {
+        this.logger.warn("Failed to claim Telegram webhook update", {
+          error: String(error),
+          updateId: update.update_id,
+        });
+        return new Response("Service unavailable", { status: 503 });
+      }
     }
 
     try {
