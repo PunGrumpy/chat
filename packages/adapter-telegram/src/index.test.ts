@@ -691,6 +691,10 @@ describe("TelegramAdapter", () => {
         media_group_id: "meal-album",
         text: undefined,
         caption: "/analyze both pieces",
+        reply_to_message: sampleMessage({
+          message_id: 40,
+          text: "original meal",
+        }),
         photo: [
           {
             file_id: "photo-1",
@@ -735,12 +739,14 @@ describe("TelegramAdapter", () => {
       {
         attachments: Array<{ fetchMetadata?: { fileId?: string } }>;
         id: string;
+        replyTo?: Message;
         text: string;
       },
     ];
     expect(threadId).toBe("telegram:123");
     expect(parsedMessage.id).toBe("123:42");
     expect(parsedMessage.text).toBe("/analyze both pieces");
+    expect(parsedMessage.replyTo?.text).toBe("original meal");
     expect(
       parsedMessage.attachments.map(
         (attachment) => attachment.fetchMetadata?.fileId
@@ -3589,6 +3595,41 @@ describe("TelegramAdapter", () => {
       "m2",
     ]);
     expect(forward.nextCursor).toBe("123:2");
+  });
+
+  it("parses replied-to message context", () => {
+    const adapter = createTelegramAdapter({
+      botToken: "token",
+      mode: "webhook",
+      logger: mockLogger,
+      userName: "mybot",
+    });
+    const parsed = adapter.parseMessage(
+      sampleMessage({
+        message_id: 12,
+        text: "reply",
+        reply_to_message: sampleMessage({
+          message_id: 11,
+          text: "original",
+          date: 1735689500,
+          from: {
+            id: 789,
+            is_bot: false,
+            first_name: "Original",
+            username: "original",
+          },
+        }),
+      })
+    );
+
+    expect(parsed.replyTo).toBeInstanceOf(Message);
+    expect(parsed.replyTo?.id).toBe("123:11");
+    expect(parsed.replyTo?.threadId).toBe("telegram:123");
+    expect(parsed.replyTo?.text).toBe("original");
+    expect(parsed.replyTo?.author.userName).toBe("original");
+    expect(parsed.replyTo?.metadata.dateSent).toEqual(
+      new Date(1735689500 * 1000)
+    );
   });
 
   it("decodes structured callback payloads into action id and value", async () => {

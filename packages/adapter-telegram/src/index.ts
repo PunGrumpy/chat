@@ -790,6 +790,7 @@ export class TelegramAdapter
         author: latestMessage.author,
         metadata: latestMessage.metadata,
         attachments: parsedMessages.flatMap((message) => message.attachments),
+        replyTo: parsedMessages.find((message) => message.replyTo)?.replyTo,
         isMention: parsedMessages.some((message) => message.isMention),
         links: parsedMessages.flatMap((message) => message.links),
       });
@@ -1869,6 +1870,9 @@ export class TelegramAdapter
             : undefined,
       },
       attachments: this.extractAttachments(raw),
+      replyTo: raw.reply_to_message
+        ? this.parseTelegramMessage(raw.reply_to_message, threadId)
+        : undefined,
       isMention: this.isBotMentioned(raw, plainText),
     });
 
