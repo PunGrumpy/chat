@@ -130,6 +130,16 @@ const TELEGRAM_MAX_POLLING_LIMIT = 100;
 const TELEGRAM_MIN_POLLING_LIMIT = 1;
 const TELEGRAM_MIN_POLLING_TIMEOUT_SECONDS = 0;
 const TELEGRAM_MAX_POLLING_TIMEOUT_SECONDS = 300;
+
+function normalizeBotTokenProvider(
+  botToken: string | (() => string | Promise<string>)
+): () => Promise<string> {
+  if (typeof botToken === "function") {
+    return async () => await botToken();
+  }
+  return () => Promise.resolve(botToken);
+}
+
 interface TelegramMessageAuthor {
   fullName: string;
   isBot: boolean | "unknown";
@@ -263,10 +273,12 @@ export class TelegramAdapter
   readonly persistThreadHistory = true;
 
   protected readonly allowedUserIds?: Set<string>;
-  protected readonly botToken: string;
+  protected readonly botTokenProvider: () => Promise<string>;
+  protected readonly staticBotToken?: string;
   protected readonly apiBaseUrl: string;
   protected readonly secretToken?: string;
-  private readonly webhookScope: string;
+  private botIdentityPromise: Promise<void> | null = null;
+  private webhookScope?: string;
   private warnedNoVerification = false;
   protected readonly logger: Logger;
   protected readonly formatConverter = new TelegramFormatConverter();
@@ -314,9 +326,8 @@ export class TelegramAdapter
         "botToken is required. Set TELEGRAM_BOT_TOKEN or provide it in config."
       );
     }
-
-    this.botToken = botToken;
-    this.webhookScope = createHash("sha256").update(botToken).digest("hex");
+    this.botTokenProvider = normalizeBotTokenProvider(botToken);
+    this.staticBotToken = typeof botToken === "string" ? botToken : undefined;
     this.apiBaseUrl = trimTrailingSlashes(
       config.apiUrl ??
         config.apiBaseUrl ??
@@ -349,6 +360,43 @@ export class TelegramAdapter
     }
   }
 
+  protected async resolveBotToken(): Promise<string> {
+    const botToken = await this.botTokenProvider();
+    if (!botToken) {
+      throw new AuthenticationError(
+        "telegram",
+        "Telegram bot token resolver returned an empty token. Check TELEGRAM_BOT_TOKEN or the Vercel Connect connector."
+      );
+    }
+    return botToken;
+  }
+
+  protected async ensureBotIdentity(): Promise<void> {
+    if (this.webhookScope) {
+      return;
+    }
+    if (!this.botIdentityPromise) {
+      this.botIdentityPromise = this.telegramFetch<TelegramUser>("getMe")
+        .then((me) => {
+          this._botUserId = String(me.id);
+          this.webhookScope = createHash("sha256")
+            .update(this._botUserId)
+            .digest("hex");
+          if (!this.hasExplicitUserName && me.username) {
+            this._userName = this.normalizeUserName(me.username);
+          }
+          this.logger.info("Telegram bot identity resolved", {
+            botUserId: this._botUserId,
+            userName: this._userName,
+          });
+        })
+        .finally(() => {
+          this.botIdentityPromise = null;
+        });
+    }
+    await this.botIdentityPromise;
+  }
+
   async initialize(chat: ChatInstance): Promise<void> {
     this.chat = chat;
 
@@ -362,16 +410,7 @@ export class TelegramAdapter
     }
 
     try {
-      const me = await this.telegramFetch<TelegramUser>("getMe");
-      this._botUserId = String(me.id);
-      if (!this.hasExplicitUserName && me.username) {
-        this._userName = this.normalizeUserName(me.username);
-      }
-
-      this.logger.info("Telegram adapter initialized", {
-        botUserId: this._botUserId,
-        userName: this._userName,
-      });
+      await this.ensureBotIdentity();
     } catch (error) {
       this.logger.warn("Failed to fetch Telegram bot identity", {
         error: String(error),
@@ -467,11 +506,27 @@ export class TelegramAdapter
     }
 
     if (this.secretToken && Number.isInteger(update.update_id)) {
+      let webhookScope = this.webhookScope;
+      if (!webhookScope) {
+        try {
+          await this.ensureBotIdentity();
+          webhookScope = this.webhookScope;
+        } catch (error) {
+          this.logger.warn(
+            "Telegram webhook update could not resolve bot identity",
+            { error: String(error) }
+          );
+          return new Response("Service unavailable", { status: 503 });
+        }
+      }
+      if (!webhookScope) {
+        return new Response("Service unavailable", { status: 503 });
+      }
       try {
         const claimed = await this.chat
           .getState()
           .setIfNotExists(
-            `${this.name}:webhook-update:${this.webhookScope}:${update.update_id}`,
+            `${this.name}:webhook-update:${webhookScope}:${update.update_id}`,
             true,
             TELEGRAM_WEBHOOK_UPDATE_TTL_MS
           );
@@ -2018,7 +2073,8 @@ export class TelegramAdapter
       throw new ResourceNotFoundError("telegram", "file", fileId);
     }
 
-    const fileUrl = `${this.apiBaseUrl}/file/bot${this.botToken}/${file.file_path}`;
+    const botToken = this.staticBotToken ?? (await this.resolveBotToken());
+    const fileUrl = `${this.apiBaseUrl}/file/bot${botToken}/${file.file_path}`;
 
     let response: Response;
     try {
@@ -3087,7 +3143,8 @@ export class TelegramAdapter
       signal?: AbortSignal;
     }
   ): Promise<TResult> {
-    const url = `${this.apiBaseUrl}/bot${this.botToken}/${method}`;
+    const botToken = this.staticBotToken ?? (await this.resolveBotToken());
+    const url = `${this.apiBaseUrl}/bot${botToken}/${method}`;
 
     let response: Response;
     try {
