@@ -523,6 +523,12 @@ export interface Adapter<TThreadId = unknown, TRawMessage = unknown> {
   /** Render formatted content to platform-specific string */
   renderFormatted(content: FormattedContent): string;
 
+  reply?(
+    threadId: string,
+    messageId: string,
+    message: AdapterPostableMessage
+  ): Promise<RawMessage<TRawMessage>>;
+
   /**
    * Schedule a message for future delivery.
    *
@@ -1321,6 +1327,36 @@ export interface Thread<TState = Record<string, unknown>, TRawMessage = unknown>
    * Fetches the latest 50 messages and updates `recentMessages`.
    */
   refresh(): Promise<void>;
+
+  /**
+   * Reply to a specific message in this thread, using the platform's native
+   * reply (quote, threaded reply) rather than posting a loose message.
+   *
+   * Throws `NotImplementedError` on adapters without native reply support.
+   *
+   * @param target - The message to reply to, or its id. Prefer passing the
+   *   `Message`: it is checked against this thread, and it is carried through
+   *   to `SentMessage.replyTo` and cached thread history. A raw id is resolved
+   *   only if it matches a message this thread already holds (`recentMessages`
+   *   or the message being handled); otherwise the reply is still sent, but
+   *   `replyTo` is left undefined and no cross-thread check happens.
+   * @param message - Reply content. Streams are buffered and posted as one
+   *   message rather than streamed edit-by-edit.
+   *
+   * @example
+   * ```typescript
+   * chat.onNewMessage(async (thread, message) => {
+   *   await thread.reply(message, 'Got it');
+   * });
+   * ```
+   */
+  reply(
+    target: string | Message<TRawMessage>,
+    message:
+      | AdapterPostableMessage
+      | AsyncIterable<string | StreamChunk | StreamEvent>
+      | ChatElement
+  ): Promise<SentMessage<TRawMessage>>;
 
   /**
    * Show typing indicator in the thread.
