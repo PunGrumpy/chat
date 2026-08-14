@@ -5192,9 +5192,9 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       latest,
     });
 
-    // Fetch a larger batch to ensure we can return the last `limit` messages
-    // Slack API max is 1000 messages per request
-    const fetchLimit = Math.min(1000, Math.max(limit * 2, 200));
+    // Slack pages replies from the oldest message. Fetch its largest allowed page so slicing the
+    // tail below actually returns the newest requested messages for threads up to that limit.
+    const fetchLimit = 1000;
 
     const result = await this._client.conversations.replies(
       await this.withToken({

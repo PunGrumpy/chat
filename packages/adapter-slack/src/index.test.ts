@@ -5620,6 +5620,51 @@ describe("fetchMessages", () => {
     expect(result.messages.length).toBeGreaterThan(0);
   });
 
+  it("returns the newest messages when a thread exceeds the old fetch window", async () => {
+    const adapter = createSlackAdapter({
+      botToken: "xoxb-test-token",
+      signingSecret: secret,
+      logger: mockLogger,
+      botUserId: "U_BOT",
+    });
+    const threadMessages = Array.from({ length: 250 }, (_, index) => ({
+      type: "message",
+      user: "U1",
+      text: `message-${index + 1}`,
+      ts: `${String(1000 + index)}.000000`,
+      channel: "C123",
+    }));
+    const mockReplies = vi.fn(async ({ limit }: { limit: number }) => ({
+      ok: true,
+      messages: threadMessages.slice(0, limit),
+      has_more: threadMessages.length > limit,
+    }));
+    mockClientMethod(adapter, "conversations.replies", mockReplies);
+    mockClientMethod(
+      adapter,
+      "users.info",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        user: { name: "user1" },
+      })
+    );
+
+    const state = createMockState();
+    await adapter.initialize(createMockChatInstance({ state }));
+
+    const result = await adapter.fetchMessages("slack:C123:1234567890.000000", {
+      limit: 2,
+    });
+
+    expect(mockReplies).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 1000 })
+    );
+    expect(result.messages.map((message) => message.text)).toEqual([
+      "message-249",
+      "message-250",
+    ]);
+  });
+
   it("passes cursor for backward pagination", async () => {
     const adapter = createSlackAdapter({
       botToken: "xoxb-test-token",
