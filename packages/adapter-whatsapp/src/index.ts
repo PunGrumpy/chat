@@ -23,6 +23,7 @@ import type {
   Logger,
   RawMessage,
   ReactionEvent,
+  StateAdapter,
   StreamChunk,
   StreamOptions,
   ThreadInfo,
@@ -56,6 +57,7 @@ import type {
   WhatsAppThreadId,
   WhatsAppTypingIndicatorResponse,
   WhatsAppWebhookPayload,
+  WhatsAppWebhookValue,
 } from "./types";
 
 /** Platform label for shared buffer utilities (not yet in PlatformName union). */
@@ -88,6 +90,26 @@ interface ResolvedWhatsAppMedia {
   payload: { id?: string; link?: string };
   type: WhatsAppMediaType;
 }
+
+interface WhatsAppIdentity {
+  bsuid?: string;
+  parent?: string;
+  phone?: string;
+  userId: string;
+}
+
+interface WhatsAppRoute {
+  bsuid?: string;
+  parent?: string;
+  phone?: string;
+}
+
+interface WhatsAppRecipient {
+  recipient?: string;
+  to?: string;
+}
+
+const BSUID_PATTERN = /^[A-Z]{2}\.(?:ENT\.)?[A-Za-z0-9]{1,128}$/;
 
 const EXTENSION_MIME_TYPES: Record<string, string> = {
   ".gif": "image/gif",
@@ -372,6 +394,11 @@ export class WhatsAppAdapter
     // Process entries
     for (const entry of payload.entry) {
       for (const change of entry.changes) {
+        if (change.field === "user_id_update") {
+          await this.handleUserIdUpdate(change.value);
+          continue;
+        }
+
         if (change.field !== "messages") {
           continue;
         }
@@ -382,11 +409,33 @@ export class WhatsAppAdapter
         if (value.messages) {
           for (const message of value.messages) {
             try {
+              const contact =
+                value.contacts?.find(
+                  (item) =>
+                    (message.from_user_id &&
+                      item.user_id === message.from_user_id) ||
+                    (message.from && item.wa_id === message.from)
+                ) ?? value.contacts?.[0];
+              const identity = await this.resolve(
+                message,
+                contact,
+                value.metadata.phone_number_id
+              );
+              if (!identity) {
+                this.logger.warn("WhatsApp message has no user identifier", {
+                  messageId: message.id,
+                });
+                continue;
+              }
+              if (message.type === "system") {
+                continue;
+              }
               this.handleInboundMessage(
                 message,
-                value.contacts?.[0],
+                contact,
                 value.metadata.phone_number_id,
-                options
+                options,
+                identity
               );
             } catch (error) {
               this.logger.error("Failed to handle inbound message", {
@@ -454,28 +503,43 @@ export class WhatsAppAdapter
     inbound: WhatsAppInboundMessage,
     contact: WhatsAppContact | undefined,
     phoneNumberId: string,
-    options?: WebhookOptions
+    options?: WebhookOptions,
+    identity?: WhatsAppIdentity
   ): void {
     if (!this.chat) {
       this.logger.warn("Chat instance not initialized, ignoring message");
       return;
     }
 
+    const user = identity ?? this.fields(inbound, contact);
+    if (!user) {
+      this.logger.warn("WhatsApp message has no user identifier", {
+        messageId: inbound.id,
+      });
+      return;
+    }
+
     // Handle reactions separately
     if (inbound.type === "reaction" && inbound.reaction) {
-      this.handleReaction(inbound, contact, phoneNumberId, options);
+      this.handleReaction(inbound, contact, phoneNumberId, options, user);
       return;
     }
 
     // Handle interactive message replies (button clicks)
     if (inbound.type === "interactive" && inbound.interactive) {
-      this.handleInteractiveReply(inbound, contact, phoneNumberId, options);
+      this.handleInteractiveReply(
+        inbound,
+        contact,
+        phoneNumberId,
+        options,
+        user
+      );
       return;
     }
 
     // Handle legacy button responses (from template quick replies)
     if (inbound.type === "button" && inbound.button) {
-      this.handleButtonResponse(inbound, contact, phoneNumberId, options);
+      this.handleButtonResponse(inbound, contact, phoneNumberId, options, user);
       return;
     }
 
@@ -491,7 +555,7 @@ export class WhatsAppAdapter
 
     const threadId = this.encodeThreadId({
       phoneNumberId,
-      userWaId: inbound.from,
+      userWaId: user.userId,
     });
 
     const message = this.buildMessage(
@@ -499,7 +563,8 @@ export class WhatsAppAdapter
       contact,
       threadId,
       text,
-      phoneNumberId
+      phoneNumberId,
+      user
     );
     this.chat.processMessage(this, threadId, message, options);
   }
@@ -511,15 +576,21 @@ export class WhatsAppAdapter
     inbound: WhatsAppInboundMessage,
     contact: WhatsAppContact | undefined,
     phoneNumberId: string,
-    options?: WebhookOptions
+    options?: WebhookOptions,
+    identity?: WhatsAppIdentity
   ): void {
     if (!(this.chat && inbound.reaction)) {
       return;
     }
 
+    const user = identity ?? this.fields(inbound, contact);
+    if (!user) {
+      return;
+    }
+
     const threadId = this.encodeThreadId({
       phoneNumberId,
-      userWaId: inbound.from,
+      userWaId: user.userId,
     });
 
     const rawEmoji = inbound.reaction.emoji;
@@ -527,19 +598,13 @@ export class WhatsAppAdapter
     const added = rawEmoji !== "";
     const emojiValue = added ? getEmoji(rawEmoji) : getEmoji("");
 
-    const user: Author = {
-      userId: inbound.from,
-      userName: contact?.profile.name || inbound.from,
-      fullName: contact?.profile.name || inbound.from,
-      isBot: false,
-      isMe: false,
-    };
+    const author = this.author(user, contact);
 
     const event: Omit<ReactionEvent, "adapter" | "thread"> = {
       emoji: emojiValue,
       rawEmoji,
       added,
-      user,
+      user: author,
       messageId: inbound.reaction.message_id,
       threadId,
       raw: inbound,
@@ -555,15 +620,21 @@ export class WhatsAppAdapter
     inbound: WhatsAppInboundMessage,
     contact: WhatsAppContact | undefined,
     phoneNumberId: string,
-    options?: WebhookOptions
+    options?: WebhookOptions,
+    identity?: WhatsAppIdentity
   ): void {
     if (!(this.chat && inbound.interactive)) {
       return;
     }
 
+    const user = identity ?? this.fields(inbound, contact);
+    if (!user) {
+      return;
+    }
+
     const threadId = this.encodeThreadId({
       phoneNumberId,
-      userWaId: inbound.from,
+      userWaId: user.userId,
     });
 
     const { interactive } = inbound;
@@ -587,13 +658,7 @@ export class WhatsAppAdapter
         adapter: this,
         actionId,
         value: value ?? fallbackValue,
-        user: {
-          userId: inbound.from,
-          userName: contact?.profile.name || inbound.from,
-          fullName: contact?.profile.name || inbound.from,
-          isBot: false,
-          isMe: false,
-        },
+        user: this.author(user, contact),
         messageId: inbound.id,
         threadId,
         raw: inbound,
@@ -609,15 +674,21 @@ export class WhatsAppAdapter
     inbound: WhatsAppInboundMessage,
     contact: WhatsAppContact | undefined,
     phoneNumberId: string,
-    options?: WebhookOptions
+    options?: WebhookOptions,
+    identity?: WhatsAppIdentity
   ): void {
     if (!(this.chat && inbound.button)) {
       return;
     }
 
+    const user = identity ?? this.fields(inbound, contact);
+    if (!user) {
+      return;
+    }
+
     const threadId = this.encodeThreadId({
       phoneNumberId,
-      userWaId: inbound.from,
+      userWaId: user.userId,
     });
 
     this.chat.processAction(
@@ -625,19 +696,222 @@ export class WhatsAppAdapter
         adapter: this,
         actionId: inbound.button.payload,
         value: inbound.button.text,
-        user: {
-          userId: inbound.from,
-          userName: contact?.profile.name || inbound.from,
-          fullName: contact?.profile.name || inbound.from,
-          isBot: false,
-          isMe: false,
-        },
+        user: this.author(user, contact),
         messageId: inbound.id,
         threadId,
         raw: inbound,
       },
       options
     );
+  }
+
+  protected author(
+    identity: WhatsAppIdentity,
+    contact?: WhatsAppContact
+  ): Author {
+    // `||` rather than `??`: an empty-string profile name must still fall
+    // back to the user ID.
+    return {
+      userId: identity.userId,
+      userName:
+        contact?.profile.username || contact?.profile.name || identity.userId,
+      fullName:
+        contact?.profile.name || contact?.profile.username || identity.userId,
+      isBot: false,
+      isMe: identity.userId === this._botUserId,
+    };
+  }
+
+  private fields(
+    inbound: WhatsAppInboundMessage,
+    contact?: WhatsAppContact
+  ): WhatsAppIdentity | null {
+    const phone = inbound.system?.wa_id ?? inbound.from ?? contact?.wa_id;
+    const bsuid =
+      inbound.system?.user_id ?? inbound.from_user_id ?? contact?.user_id;
+    const parent =
+      inbound.system?.parent_user_id ??
+      inbound.from_parent_user_id ??
+      contact?.parent_user_id;
+    const userId = phone ?? bsuid ?? parent;
+
+    return userId ? { bsuid, parent, phone, userId } : null;
+  }
+
+  protected async resolve(
+    inbound: WhatsAppInboundMessage,
+    contact: WhatsAppContact | undefined,
+    phoneNumberId: string
+  ): Promise<WhatsAppIdentity | null> {
+    const identity = this.fields(inbound, contact);
+    if (!identity) {
+      return null;
+    }
+
+    const { bsuid, parent, phone } = identity;
+    const changed = inbound.type === "system";
+    // A system message's `from` carries the pre-change identifier, so
+    // prefer it as the canonical fallback — a thread that predates any
+    // alias state keeps its original key that way.
+    const source = changed ? inbound.from : undefined;
+    const fallback = source ?? identity.userId;
+
+    if (!this.chat) {
+      return { bsuid, parent, phone, userId: fallback };
+    }
+
+    const identifiers = [source, bsuid, parent, phone].filter(
+      (value): value is string => Boolean(value)
+    );
+
+    try {
+      return await this.link(
+        this.chat.getState(),
+        phoneNumberId,
+        identifiers,
+        fallback,
+        (route) => ({
+          bsuid: bsuid ?? route.bsuid,
+          parent: parent ?? route.parent,
+          // A system message re-keys the phone: absent means the user no
+          // longer exposes one, so any stored number is stale.
+          phone: changed ? phone : (phone ?? route.phone),
+        })
+      );
+    } catch (error) {
+      this.logger.warn("Failed to persist WhatsApp user identity", {
+        error,
+        messageId: inbound.id,
+      });
+      return { bsuid, parent, phone, userId: fallback };
+    }
+  }
+
+  /**
+   * Handle a `user_id_update` change, which Meta sends when a phone
+   * number change rotates a user's business-scoped user ID. The payload
+   * carries the previous and current values, so both get aliased to the
+   * same canonical user and the route picks up the new identifiers.
+   *
+   * @see https://developers.facebook.com/documentation/business-messaging/whatsapp/business-scoped-user-ids
+   */
+  protected async handleUserIdUpdate(
+    value: WhatsAppWebhookValue
+  ): Promise<void> {
+    if (!this.chat) {
+      return;
+    }
+
+    const phoneNumberId = value.metadata.phone_number_id;
+    for (const update of value.user_id_update ?? []) {
+      const identifiers = [
+        update.user_id?.previous,
+        update.parent_user_id?.previous,
+        update.user_id?.current,
+        update.parent_user_id?.current,
+        update.wa_id,
+      ].filter((identifier): identifier is string => Boolean(identifier));
+      // Prefer the previous BSUID as the canonical fallback so a thread
+      // keyed by it survives the rotation even without alias state.
+      const fallback = identifiers[0];
+      if (!fallback) {
+        continue;
+      }
+
+      try {
+        await this.link(
+          this.chat.getState(),
+          phoneNumberId,
+          identifiers,
+          fallback,
+          (route) => ({
+            bsuid: update.user_id?.current ?? route.bsuid,
+            parent: update.parent_user_id?.current ?? route.parent,
+            // The rotation implies a phone number change, so any stored
+            // phone is stale; keep only the update's wa_id, when present.
+            phone: update.wa_id,
+          })
+        );
+      } catch (error) {
+        this.logger.warn("Failed to apply WhatsApp user ID update", { error });
+      }
+    }
+  }
+
+  /**
+   * Resolve the canonical user ID for a set of equivalent identifiers
+   * and persist the alias and route entries that changed. Aliases are
+   * looked up in parallel but honored in order, so callers should list
+   * the identifiers most likely to match an existing thread first.
+   */
+  private async link(
+    state: StateAdapter,
+    phoneNumberId: string,
+    identifiers: string[],
+    fallback: string,
+    merge: (route: WhatsAppRoute) => WhatsAppRoute
+  ): Promise<WhatsAppIdentity> {
+    const aliases = await Promise.all(
+      identifiers.map((identifier) =>
+        state.get<string>(this.key("alias", phoneNumberId, identifier))
+      )
+    );
+    const userId =
+      aliases.find((value): value is string => Boolean(value)) ?? fallback;
+
+    const path = this.key("route", phoneNumberId, userId);
+    const route = (await state.get<WhatsAppRoute>(path)) ?? {};
+    const updated = merge(route);
+
+    const writes = identifiers
+      .filter((_, index) => aliases[index] !== userId)
+      .map((identifier) =>
+        state.set(this.key("alias", phoneNumberId, identifier), userId)
+      );
+    if (
+      route.bsuid !== updated.bsuid ||
+      route.parent !== updated.parent ||
+      route.phone !== updated.phone
+    ) {
+      writes.push(state.set(path, updated));
+    }
+    await Promise.all(writes);
+
+    return { ...updated, userId };
+  }
+
+  protected async recipient(
+    threadId: string,
+    userId: string
+  ): Promise<WhatsAppRecipient> {
+    if (this.chat) {
+      try {
+        const { phoneNumberId } = this.decodeThreadId(threadId);
+        const route = await this.chat
+          .getState()
+          .get<WhatsAppRoute>(this.key("route", phoneNumberId, userId));
+        const recipient = route?.bsuid ?? route?.parent;
+        // Only honor a stored route that can actually address someone;
+        // an empty route falls through to the userId below.
+        if (route?.phone || recipient) {
+          return {
+            ...(route?.phone ? { to: route.phone } : {}),
+            ...(recipient ? { recipient } : {}),
+          };
+        }
+      } catch (error) {
+        this.logger.warn("Failed to resolve WhatsApp recipient", {
+          error,
+          threadId,
+        });
+      }
+    }
+
+    return BSUID_PATTERN.test(userId) ? { recipient: userId } : { to: userId };
+  }
+
+  private key(kind: "alias" | "route", phone: string, value: string): string {
+    return `whatsapp:identity:${kind}:${phone}:${value}`;
   }
 
   /**
@@ -690,15 +964,15 @@ export class WhatsAppAdapter
     contact: WhatsAppContact | undefined,
     threadId: string,
     text: string,
-    phoneNumberId?: string
+    phoneNumberId: string | undefined,
+    identity?: WhatsAppIdentity
   ): Message<WhatsAppRawMessage> {
-    const author: Author = {
-      userId: inbound.from,
-      userName: contact?.profile.name || inbound.from,
-      fullName: contact?.profile.name || inbound.from,
-      isBot: false,
-      isMe: false,
-    };
+    const user = identity ?? this.fields(inbound, contact);
+    if (!user) {
+      throw new ValidationError("whatsapp", "Message has no user identifier");
+    }
+
+    const author = this.author(user, contact);
 
     const formatted: FormattedContent = this.formatConverter.toAst(text);
 
@@ -706,6 +980,7 @@ export class WhatsAppAdapter
       message: inbound,
       contact,
       phoneNumberId: phoneNumberId || this.phoneNumberId,
+      userId: user.userId,
     };
 
     const attachments = this.buildAttachments(inbound);
@@ -909,6 +1184,9 @@ export class WhatsAppAdapter
     replyId?: string
   ): Promise<RawMessage<WhatsAppRawMessage>> {
     const { userWaId } = this.decodeThreadId(threadId);
+    // Resolve the route once per logical post; the send helpers reuse it
+    // across chunked and multi-part sends.
+    const recipient = await this.recipient(threadId, userWaId);
     const files = extractFiles(message);
     const attachments = extractPostableAttachments(message);
     const mediaItems: Array<FileUpload | Attachment> = [
@@ -922,7 +1200,8 @@ export class WhatsAppAdapter
         userWaId,
         message,
         mediaItems,
-        replyId
+        replyId,
+        recipient
       );
     }
 
@@ -943,7 +1222,8 @@ export class WhatsAppAdapter
           threadId,
           userWaId,
           interactive,
-          replyId
+          replyId,
+          recipient
         );
       }
 
@@ -951,7 +1231,8 @@ export class WhatsAppAdapter
         threadId,
         userWaId,
         convertEmojiPlaceholders(result.text, "whatsapp"),
-        replyId
+        replyId,
+        recipient
       );
     }
 
@@ -961,7 +1242,7 @@ export class WhatsAppAdapter
       "whatsapp"
     );
 
-    return this.sendTextMessage(threadId, userWaId, body, replyId);
+    return this.sendTextMessage(threadId, userWaId, body, replyId, recipient);
   }
 
   async reply(
@@ -980,7 +1261,8 @@ export class WhatsAppAdapter
     userWaId: string,
     message: AdapterPostableMessage,
     mediaItems: Array<FileUpload | Attachment>,
-    replyId?: string
+    replyId?: string,
+    recipient?: WhatsAppRecipient
   ): Promise<RawMessage<WhatsAppRawMessage>> {
     let remainingId = replyId;
     const card = extractCard(message);
@@ -1024,7 +1306,13 @@ export class WhatsAppAdapter
         !firstMedia?.captionEligible);
 
     if (useSeparateText) {
-      await this.sendTextMessage(threadId, userWaId, text, remainingId);
+      await this.sendTextMessage(
+        threadId,
+        userWaId,
+        text,
+        remainingId,
+        recipient
+      );
       remainingId = undefined;
     }
 
@@ -1046,7 +1334,8 @@ export class WhatsAppAdapter
         media.payload,
         caption,
         media.filename,
-        remainingId
+        remainingId,
+        recipient
       );
       remainingId = undefined;
     }
@@ -1064,7 +1353,8 @@ export class WhatsAppAdapter
           threadId,
           userWaId,
           interactive,
-          remainingId
+          remainingId,
+          recipient
         );
         remainingId = undefined;
       } else if (text.length === 0) {
@@ -1072,7 +1362,8 @@ export class WhatsAppAdapter
           threadId,
           userWaId,
           convertEmojiPlaceholders(cardResult.text, "whatsapp"),
-          remainingId
+          remainingId,
+          recipient
         );
         remainingId = undefined;
       }
@@ -1102,14 +1393,15 @@ export class WhatsAppAdapter
     threadId: string,
     to: string,
     text: string,
-    replyId?: string
+    replyId?: string,
+    recipient?: WhatsAppRecipient
   ): Promise<RawMessage<WhatsAppRawMessage>> {
     const response = await this.graphApiRequest<WhatsAppSendResponse>(
       `/${this.phoneNumberId}/messages`,
       {
         messaging_product: "whatsapp",
         recipient_type: "individual",
-        to,
+        ...(recipient ?? (await this.recipient(threadId, to))),
         ...(replyId ? { context: { message_id: replyId } } : {}),
         type: "text",
         text: { preview_url: false, body: text },
@@ -1147,9 +1439,12 @@ export class WhatsAppAdapter
     threadId: string,
     to: string,
     text: string,
-    replyId?: string
+    replyId?: string,
+    recipient?: WhatsAppRecipient
   ): Promise<RawMessage<WhatsAppRawMessage>> {
     const chunks = this.splitMessage(text);
+    // Resolve the route once so chunked sends share a single lookup.
+    const resolved = recipient ?? (await this.recipient(threadId, to));
     let result: RawMessage<WhatsAppRawMessage> | undefined;
 
     for (const [index, chunk] of chunks.entries()) {
@@ -1157,7 +1452,8 @@ export class WhatsAppAdapter
         threadId,
         to,
         chunk,
-        index === 0 ? replyId : undefined
+        index === 0 ? replyId : undefined,
+        resolved
       );
     }
 
@@ -1171,14 +1467,15 @@ export class WhatsAppAdapter
     threadId: string,
     to: string,
     interactive: WhatsAppInteractiveMessage,
-    replyId?: string
+    replyId?: string,
+    recipient?: WhatsAppRecipient
   ): Promise<RawMessage<WhatsAppRawMessage>> {
     const response = await this.graphApiRequest<WhatsAppSendResponse>(
       `/${this.phoneNumberId}/messages`,
       {
         messaging_product: "whatsapp",
         recipient_type: "individual",
-        to,
+        ...(recipient ?? (await this.recipient(threadId, to))),
         ...(replyId ? { context: { message_id: replyId } } : {}),
         type: "interactive",
         interactive,
@@ -1249,7 +1546,7 @@ export class WhatsAppAdapter
       {
         messaging_product: "whatsapp",
         recipient_type: "individual",
-        to: userWaId,
+        ...(await this.recipient(threadId, userWaId)),
         type: "template",
         template: {
           name: template.name,
@@ -1339,7 +1636,7 @@ export class WhatsAppAdapter
     await this.graphApiRequest(`/${this.phoneNumberId}/messages`, {
       messaging_product: "whatsapp",
       recipient_type: "individual",
-      to: userWaId,
+      ...(await this.recipient(threadId, userWaId)),
       type: "reaction",
       reaction: {
         message_id: messageId,
@@ -1364,7 +1661,7 @@ export class WhatsAppAdapter
     await this.graphApiRequest(`/${this.phoneNumberId}/messages`, {
       messaging_product: "whatsapp",
       recipient_type: "individual",
-      to: userWaId,
+      ...(await this.recipient(threadId, userWaId)),
       type: "reaction",
       reaction: {
         message_id: messageId,
@@ -1540,9 +1837,19 @@ export class WhatsAppAdapter
     const text = this.extractTextContent(raw.message) || "";
     const formatted: FormattedContent = this.formatConverter.toAst(text);
     const attachments = this.buildAttachments(raw.message);
+    // A stored canonical userId wins; otherwise derive the identity with
+    // the same precedence the webhook path uses.
+    const identity = this.fields(raw.message, raw.contact);
+    const userId = raw.userId ?? identity?.userId;
+    if (!userId) {
+      throw new ValidationError(
+        "whatsapp",
+        "WhatsApp message has no user identifier"
+      );
+    }
     const threadId = this.encodeThreadId({
       phoneNumberId: raw.phoneNumberId,
-      userWaId: raw.message.from,
+      userWaId: userId,
     });
 
     return new Message<WhatsAppRawMessage>({
@@ -1550,13 +1857,7 @@ export class WhatsAppAdapter
       threadId,
       text,
       formatted,
-      author: {
-        userId: raw.message.from,
-        userName: raw.contact?.profile.name || raw.message.from,
-        fullName: raw.contact?.profile.name || raw.message.from,
-        isBot: false,
-        isMe: raw.message.from === this._botUserId,
-      },
+      author: this.author({ ...identity, userId }, raw.contact),
       metadata: {
         dateSent: new Date(Number.parseInt(raw.message.timestamp, 10) * 1000),
         edited: false,
@@ -1661,7 +1962,8 @@ export class WhatsAppAdapter
     payload: { id?: string; link?: string },
     caption?: string,
     filename?: string,
-    replyId?: string
+    replyId?: string,
+    recipient?: WhatsAppRecipient
   ): Promise<RawMessage<WhatsAppRawMessage>> {
     const mediaObject: Record<string, string> = {};
 
@@ -1686,7 +1988,7 @@ export class WhatsAppAdapter
       {
         messaging_product: "whatsapp",
         recipient_type: "individual",
-        to,
+        ...(recipient ?? (await this.recipient(threadId, to))),
         ...(replyId ? { context: { message_id: replyId } } : {}),
         type,
         [type]: mediaObject,
