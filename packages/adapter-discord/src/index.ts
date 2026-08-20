@@ -97,8 +97,39 @@ import {
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 const DISCORD_MAX_CONTENT_LENGTH = 2000;
+const DISCORD_UNKNOWN_MESSAGE = 10_008;
+const DISCORD_THREAD_ALREADY_CREATED = 160_004;
 const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
 const HEX_PATTERN = /^[0-9a-f]+$/;
+
+class DiscordApiError extends Error {
+  readonly code?: number;
+  readonly status: number;
+
+  constructor(status: number, body: string) {
+    super(body);
+    this.name = "DiscordApiError";
+    this.status = status;
+    this.code = parseDiscordErrorCode(body);
+  }
+}
+
+function parseDiscordErrorCode(body: string): number | undefined {
+  try {
+    const data: unknown = JSON.parse(body);
+    if (
+      typeof data === "object" &&
+      data !== null &&
+      "code" in data &&
+      typeof data.code === "number"
+    ) {
+      return data.code;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
 
 interface GatewayCommandOption {
   name: string;
@@ -1432,9 +1463,8 @@ export class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
       // Recover by using the existing thread (its ID equals the parent message ID).
       if (
         error instanceof NetworkError &&
-        typeof error.message === "string" &&
-        error.message.includes('"code"') &&
-        error.message.includes("160004")
+        error.originalError instanceof DiscordApiError &&
+        error.originalError.code === DISCORD_THREAD_ALREADY_CREATED
       ) {
         this.logger.debug(
           "Thread already exists for message, reusing existing thread",
@@ -1602,25 +1632,26 @@ export class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
     messageId: string,
     message: AdapterPostableMessage
   ): Promise<RawMessage<unknown>> {
-    const { channelId, threadId: discordThreadId } =
-      this.decodeThreadId(threadId);
-    // Use thread channel ID if in a thread, otherwise use channel ID
-    const targetChannelId = discordThreadId || channelId;
-
     const { payload } = this.buildMessagePayload(message, {
       clearContentForCard: true,
     });
 
-    this.logger.debug("Discord API: PATCH message", {
-      channelId: targetChannelId,
+    const response = await this.withMessageChannel(
+      threadId,
       messageId,
-      contentLength: payload.content?.length || 0,
-    });
+      async (channelId) => {
+        this.logger.debug("Discord API: PATCH message", {
+          channelId,
+          messageId,
+          contentLength: payload.content?.length || 0,
+        });
 
-    const response = await this.discordFetch(
-      `/channels/${targetChannelId}/messages/${messageId}`,
-      "PATCH",
-      payload
+        return this.discordFetch(
+          `/channels/${channelId}/messages/${messageId}`,
+          "PATCH",
+          payload
+        );
+      }
     );
 
     const result = (await response.json()) as APIMessage;
@@ -1640,21 +1671,79 @@ export class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
    * Delete a Discord message.
    */
   async deleteMessage(threadId: string, messageId: string): Promise<void> {
+    await this.withMessageChannel(threadId, messageId, async (channelId) => {
+      this.logger.debug("Discord API: DELETE message", {
+        channelId,
+        messageId,
+      });
+
+      return this.discordFetch(
+        `/channels/${channelId}/messages/${messageId}`,
+        "DELETE"
+      );
+    });
+
+    this.logger.debug("Discord API: DELETE message response", { ok: true });
+  }
+
+  protected async withMessageChannel<T>(
+    threadId: string,
+    messageId: string,
+    operation: (channelId: string) => Promise<T>
+  ): Promise<T> {
     const { channelId, threadId: discordThreadId } =
       this.decodeThreadId(threadId);
     const targetChannelId = discordThreadId || channelId;
 
-    this.logger.debug("Discord API: DELETE message", {
-      channelId: targetChannelId,
-      messageId,
+    if (!(discordThreadId && discordThreadId === messageId)) {
+      return operation(targetChannelId);
+    }
+
+    // A thread whose ID equals the message ID is a starter message, and where
+    // that message lives depends on the parent channel. Forum and media posts
+    // keep it inside the thread; threads on a text channel keep it in the
+    // parent channel. Try the thread first and fall back to the parent on
+    // "Unknown Message". Forum channels reject message routes with a channel
+    // type error rather than 10008, so probing them first would not be
+    // recoverable.
+    try {
+      return await operation(discordThreadId);
+    } catch (error) {
+      if (
+        !(
+          error instanceof NetworkError &&
+          error.originalError instanceof DiscordApiError &&
+          error.originalError.code === DISCORD_UNKNOWN_MESSAGE
+        )
+      ) {
+        throw error;
+      }
+      return operation(channelId);
+    }
+  }
+
+  protected async withReaction(
+    threadId: string,
+    messageId: string,
+    emoji: EmojiValue | string,
+    method: "DELETE" | "PUT"
+  ): Promise<void> {
+    const emojiEncoded = this.encodeEmoji(emoji);
+
+    await this.withMessageChannel(threadId, messageId, async (channelId) => {
+      this.logger.debug(`Discord API: ${method} reaction`, {
+        channelId,
+        messageId,
+        emoji: emojiEncoded,
+      });
+
+      return this.discordFetch(
+        `/channels/${channelId}/messages/${messageId}/reactions/${emojiEncoded}/@me`,
+        method
+      );
     });
 
-    await this.discordFetch(
-      `/channels/${targetChannelId}/messages/${messageId}`,
-      "DELETE"
-    );
-
-    this.logger.debug("Discord API: DELETE message response", { ok: true });
+    this.logger.debug(`Discord API: ${method} reaction response`, { ok: true });
   }
 
   /**
@@ -1665,23 +1754,7 @@ export class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
     messageId: string,
     emoji: EmojiValue | string
   ): Promise<void> {
-    const { channelId, threadId: discordThreadId } =
-      this.decodeThreadId(threadId);
-    const targetChannelId = discordThreadId || channelId;
-    const emojiEncoded = this.encodeEmoji(emoji);
-
-    this.logger.debug("Discord API: PUT reaction", {
-      channelId: targetChannelId,
-      messageId,
-      emoji: emojiEncoded,
-    });
-
-    await this.discordFetch(
-      `/channels/${targetChannelId}/messages/${messageId}/reactions/${emojiEncoded}/@me`,
-      "PUT"
-    );
-
-    this.logger.debug("Discord API: PUT reaction response", { ok: true });
+    await this.withReaction(threadId, messageId, emoji, "PUT");
   }
 
   /**
@@ -1692,23 +1765,7 @@ export class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
     messageId: string,
     emoji: EmojiValue | string
   ): Promise<void> {
-    const { channelId, threadId: discordThreadId } =
-      this.decodeThreadId(threadId);
-    const targetChannelId = discordThreadId || channelId;
-    const emojiEncoded = this.encodeEmoji(emoji);
-
-    this.logger.debug("Discord API: DELETE reaction", {
-      channelId: targetChannelId,
-      messageId,
-      emoji: emojiEncoded,
-    });
-
-    await this.discordFetch(
-      `/channels/${targetChannelId}/messages/${messageId}/reactions/${emojiEncoded}/@me`,
-      "DELETE"
-    );
-
-    this.logger.debug("Discord API: DELETE reaction response", { ok: true });
+    await this.withReaction(threadId, messageId, emoji, "DELETE");
   }
 
   /**
@@ -2076,7 +2133,8 @@ export class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
       });
       throw new NetworkError(
         "discord",
-        `Discord API error: ${response.status} ${errorText}`
+        `Discord API error: ${response.status} ${errorText}`,
+        new DiscordApiError(response.status, errorText)
       );
     }
 
