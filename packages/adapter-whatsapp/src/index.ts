@@ -1,7 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
   AdapterError,
+  type AttachmentTransport,
   cardToFallbackText,
+  downloadAttachment,
   extractCard,
   extractFiles,
   extractPostableAttachments,
@@ -1150,7 +1152,10 @@ export class WhatsAppAdapter
    *
    * @see https://developers.facebook.com/docs/whatsapp/cloud-api/reference/media#download-media
    */
-  async downloadMedia(mediaId: string): Promise<Buffer> {
+  async downloadMedia(
+    mediaId: string,
+    transport?: AttachmentTransport
+  ): Promise<Buffer> {
     // Step 1: Get the media URL
     const metaResponse = await fetch(`${this.graphApiUrl}/${mediaId}`, {
       headers: { Authorization: `Bearer ${this.accessToken}` },
@@ -1178,21 +1183,35 @@ export class WhatsAppAdapter
       );
     }
 
-    // Step 2: Download the actual file
-    const dataResponse = await fetch(mediaInfo.url, {
-      headers: { Authorization: `Bearer ${this.accessToken}` },
-    });
-
-    if (!dataResponse.ok) {
-      this.logger.error("Failed to download media", {
-        status: dataResponse.status,
-        mediaId,
+    // Step 2: Download the actual file. Every hop is checked against the
+    // exact-origin and Meta media host policy before the access token is
+    // attached, so a redirect cannot carry it to an off-policy host.
+    try {
+      return await downloadAttachment(mediaInfo.url, {
+        adapter: "whatsapp",
+        headers: (target) => {
+          if (!isWhatsAppMediaUrl(target.href, this.graphApiUrl)) {
+            throw new NetworkError(
+              "whatsapp",
+              "Refusing to send the access token to an untrusted media URL"
+            );
+          }
+          return { authorization: `Bearer ${this.accessToken}` };
+        },
+        hosts: [...WHATSAPP_MEDIA_HOSTS, new URL(this.graphApiUrl).hostname],
+        transport,
       });
-      throw new Error(`Failed to download media: ${dataResponse.status}`);
+    } catch (error) {
+      this.logger.error("Failed to download media", { mediaId });
+      if (error instanceof NetworkError) {
+        throw error;
+      }
+      throw new NetworkError(
+        "whatsapp",
+        `Failed to download media ${mediaId}`,
+        error instanceof Error ? error : undefined
+      );
     }
-
-    const arrayBuffer = await dataResponse.arrayBuffer();
-    return Buffer.from(arrayBuffer);
   }
 
   /**
