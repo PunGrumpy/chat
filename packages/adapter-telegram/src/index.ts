@@ -336,6 +336,7 @@ export class TelegramAdapter
   protected readonly staticBotToken?: string;
   protected readonly apiBaseUrl: string;
   protected readonly secretToken?: string;
+  protected readonly mentionOnReply: boolean;
   private botIdentityPromise: Promise<void> | null = null;
   private webhookScope?: string;
   private warnedNoVerification = false;
@@ -400,6 +401,8 @@ export class TelegramAdapter
     this.allowUnverifiedWebhooks =
       config.allowUnverifiedWebhooks ??
       process.env.TELEGRAM_ALLOW_UNVERIFIED_WEBHOOKS === "true";
+    this.mentionOnReply =
+      config.mentionOnReply ?? process.env.TELEGRAM_MENTION_ON_REPLY === "true";
     const allowedUserIds =
       config.allowedUserIds ??
       process.env.TELEGRAM_ALLOWED_USER_IDS?.split(",");
@@ -3094,6 +3097,29 @@ export class TelegramAdapter
   }
 
   protected isBotMentioned(message: TelegramMessage, text: string): boolean {
+    // Replying to one of the bot's own messages addresses it as directly as an
+    // @mention does — it is how Telegram users continue a conversation without
+    // repeating the handle. Opt-in, and checked before the empty-text guard so
+    // a reply carrying only a photo or a document still counts.
+    //
+    // Two payload shapes look like a reply to the bot but are not one:
+    // - In forum topics every message carries reply_to_message pointing at the
+    //   topic-creation service message (its message_id equals
+    //   message_thread_id), authored by whoever created the topic — the bot,
+    //   when it did. Only an explicit reply to a different message counts.
+    // - The Bot API echoes the bot's own outbound replies back in send
+    //   responses; the bot replying to itself is not a user addressing it.
+    if (
+      this.mentionOnReply &&
+      this._botUserId &&
+      message.reply_to_message?.from &&
+      String(message.reply_to_message.from.id) === this._botUserId &&
+      message.reply_to_message.message_id !== message.message_thread_id &&
+      !(message.from && String(message.from.id) === this._botUserId)
+    ) {
+      return true;
+    }
+
     if (!text) {
       return false;
     }
@@ -3404,6 +3430,21 @@ export class TelegramAdapter
         );
 
         consecutiveFailures = 0;
+
+        // A failed startup getMe leaves _botUserId unset, which silently
+        // disables identity-based checks (text_mention, mentionOnReply).
+        // Webhook mode retries lazily per update; do the same here now that a
+        // successful getUpdates proves the API is reachable again.
+        if (updates.length > 0 && !this.webhookScope) {
+          try {
+            await this.ensureBotIdentity();
+          } catch (error) {
+            this.logger.warn(
+              "Telegram polling could not resolve bot identity",
+              { error: String(error) }
+            );
+          }
+        }
 
         for (const update of updates) {
           offset = update.update_id + 1;
