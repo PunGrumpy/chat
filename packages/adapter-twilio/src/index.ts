@@ -28,7 +28,18 @@ import {
   type TwilioApiOptions,
   type TwilioMessageResource,
 } from "./api";
-import { cardToTwilioText } from "./cards";
+import { getOrCreateTwilioContent } from "./api/content";
+import {
+  cardToTwilioRcs,
+  cardToTwilioText,
+  decodeTwilioCallbackData,
+  TWILIO_EMPTY_CARD_FALLBACK,
+} from "./cards";
+import {
+  isRcsCapableSender,
+  normalizeRcsSenderId,
+  resolveInboundThreadSender,
+} from "./channel";
 import {
   TWILIO_MESSAGE_LIMIT,
   truncateTwilioText,
@@ -66,11 +77,13 @@ export class TwilioAdapter
   protected readonly accountSid?: TwilioAdapterConfig["accountSid"];
   protected readonly apiUrl?: string;
   protected readonly authToken?: TwilioAdapterConfig["authToken"];
+  protected readonly contentApiUrl?: string;
   protected readonly fetch?: TwilioAdapterConfig["fetch"];
   protected readonly formatConverter = new TwilioFormatConverter();
   protected readonly logger: Logger;
   protected readonly messagingServiceSid?: string;
   protected readonly phoneNumber?: string;
+  protected readonly rcsSenderId?: string;
   protected readonly statusCallbackUrl?: string;
   protected readonly webhookUrl?: TwilioAdapterConfig["webhookUrl"];
   protected readonly webhookVerifier?: TwilioAdapterConfig["webhookVerifier"];
@@ -79,11 +92,13 @@ export class TwilioAdapter
     this.accountSid = config.accountSid;
     this.apiUrl = config.apiUrl;
     this.authToken = config.authToken;
+    this.contentApiUrl = config.contentApiUrl;
     this.fetch = config.fetch;
     this.logger = config.logger ?? new ConsoleLogger("info").child("twilio");
     this.messagingServiceSid =
       config.messagingServiceSid ?? process.env.TWILIO_MESSAGING_SERVICE_SID;
     this.phoneNumber = config.phoneNumber ?? process.env.TWILIO_PHONE_NUMBER;
+    this.rcsSenderId = config.rcsSenderId ?? process.env.TWILIO_RCS_SENDER_ID;
     this.statusCallbackUrl = config.statusCallbackUrl;
     this.userName = config.userName ?? "bot";
     this.webhookUrl = config.webhookUrl;
@@ -119,17 +134,72 @@ export class TwilioAdapter
       throw error;
     }
 
-    if (payload.kind !== "text" || !this.chat) {
+    if (!this.chat) {
       return twimlResponse();
+    }
+
+    if (payload.kind === "action") {
+      this.handleButtonAction(payload, options);
+      return twimlResponse();
+    }
+
+    if (payload.kind === "text") {
+      const threadId = this.encodeThreadId({
+        recipient: payload.from,
+        sender: this.inboundThreadSender(payload),
+      });
+      const message = this.parseTwilioTextPayload(payload, threadId);
+      this.chat.processMessage(this, threadId, message, options);
+      return twimlResponse();
+    }
+
+    if (payload.kind === "status") {
+      if (payload.eventType) {
+        this.logger.debug("Twilio status event", {
+          eventType: payload.eventType,
+          messageSid: payload.messageSid,
+          channelPrefix: payload.channelPrefix,
+        });
+      }
+      return twimlResponse();
+    }
+
+    return twimlResponse();
+  }
+
+  protected handleButtonAction(
+    payload: TwilioWebhookPayload & { kind: "action" },
+    options?: WebhookOptions
+  ): void {
+    if (!this.chat) {
+      return;
     }
 
     const threadId = this.encodeThreadId({
       recipient: payload.from,
-      sender: payload.to,
+      sender: this.inboundThreadSender(payload),
     });
-    const message = this.parseTwilioTextPayload(payload, threadId);
-    this.chat.processMessage(this, threadId, message, options);
-    return twimlResponse();
+
+    const { actionId, value } = decodeTwilioCallbackData(payload.buttonPayload);
+
+    this.chat.processAction(
+      {
+        adapter: this,
+        actionId,
+        value: value ?? payload.buttonText,
+        messageId: payload.messageSid ?? `action:${Date.now()}`,
+        threadId,
+        user: {
+          userId: payload.from,
+          userName: payload.from,
+          fullName: payload.from,
+          isBot: false,
+          isMe: false,
+        },
+        raw: payload,
+      },
+      options
+    );
   }
 
   async postMessage(
@@ -137,6 +207,46 @@ export class TwilioAdapter
     message: AdapterPostableMessage
   ): Promise<RawMessage<TwilioRawMessage>> {
     const thread = this.decodeThreadId(threadId);
+    const card = extractCard(message);
+
+    if (card && isRcsCapableSender(thread.sender)) {
+      const rcsResult = cardToTwilioRcs(card);
+      if (rcsResult.type === "content") {
+        // Only template resolution falls back to plain text. Once the send
+        // itself starts, errors propagate: a failed response does not prove
+        // the message was not delivered, and falling back here could send
+        // the recipient a duplicate.
+        let contentSid: string | undefined;
+        try {
+          const content = await getOrCreateTwilioContent({
+            ...this.apiOptions(),
+            contentApiUrl: this.contentApiUrl,
+            contentBody: rcsResult.contentBody,
+          });
+          contentSid = content.sid;
+        } catch (error) {
+          this.logger.warn(
+            "RCS content template resolution failed, falling back to text",
+            { error: String(error) }
+          );
+        }
+        if (contentSid) {
+          const raw = await sendTwilioMessage({
+            ...this.apiOptions(),
+            contentSid,
+            statusCallbackUrl: this.statusCallbackUrl,
+            to: thread.recipient,
+            ...senderFields(thread.sender),
+          });
+          return {
+            id: raw.sid,
+            raw,
+            threadId: this.threadIdForResource(raw, thread),
+          };
+        }
+      }
+    }
+
     const body = this.renderPostableText(message);
     const mediaUrl = this.mediaUrls(message);
     if (!body && mediaUrl.length === 0) {
@@ -194,12 +304,21 @@ export class TwilioAdapter
 
   parseMessage(raw: TwilioRawMessage): Message<TwilioRawMessage> {
     if (isTwilioWebhookPayload(raw)) {
+      if (raw.kind === "action") {
+        throw new ValidationError(
+          "twilio",
+          "Cannot parse action webhook as message"
+        );
+      }
       if (raw.kind !== "text") {
         throw new ValidationError("twilio", "Cannot parse unsupported webhook");
       }
       return this.parseTwilioTextPayload(
         raw,
-        this.encodeThreadId({ recipient: raw.from, sender: raw.to })
+        this.encodeThreadId({
+          recipient: raw.from,
+          sender: this.inboundThreadSender(raw),
+        })
       );
     }
     return this.parseTwilioResource(raw, undefined);
@@ -300,7 +419,10 @@ export class TwilioAdapter
 
   rehydrateAttachment(attachment: Attachment): Attachment {
     const url = attachment.fetchMetadata?.twilioMediaUrl ?? attachment.url;
-    if (!url) {
+    // Only Twilio media URLs get an authenticated fetcher. Location shares
+    // (geo: URLs) and other non-HTTP attachments pass through untouched so
+    // their coordinates in fetchMetadata survive rehydration.
+    if (!(url && HTTP_URL_PATTERN.test(url))) {
       return attachment;
     }
     return this.twilioAttachment({
@@ -313,8 +435,28 @@ export class TwilioAdapter
     raw: TwilioWebhookPayload & { kind: "text" },
     threadId: string
   ): Message<TwilioRawMessage> {
+    const attachments = raw.media.map((media) => this.twilioAttachment(media));
+
+    if (raw.latitude && raw.longitude) {
+      const locationMeta: Record<string, string> = {
+        latitude: raw.latitude,
+        longitude: raw.longitude,
+      };
+      if (raw.address) {
+        locationMeta.address = raw.address;
+      }
+      if (raw.label) {
+        locationMeta.label = raw.label;
+      }
+      attachments.push({
+        fetchMetadata: locationMeta,
+        type: "file",
+        url: `geo:${raw.latitude},${raw.longitude}`,
+      });
+    }
+
     return new Message({
-      attachments: raw.media.map((media) => this.twilioAttachment(media)),
+      attachments,
       author: this.author(raw.from, false),
       formatted: this.formatConverter.toAst(raw.body),
       id: raw.messageSid ?? `twilio:${Date.now()}`,
@@ -366,8 +508,10 @@ export class TwilioAdapter
 
   protected renderPostableText(message: AdapterPostableMessage): string {
     const card = extractCard(message);
+    // An actions-only card has no text content of its own; posting it must
+    // still produce a non-empty SMS body rather than a validation error.
     const text = card
-      ? cardToTwilioText(card)
+      ? cardToTwilioText(card) || TWILIO_EMPTY_CARD_FALLBACK
       : this.formatConverter.renderPostable(message);
     return truncateTwilioText(text, { limit: TWILIO_MESSAGE_LIMIT }).text;
   }
@@ -423,14 +567,34 @@ export class TwilioAdapter
   }
 
   protected defaultSender(): string {
-    const sender = this.phoneNumber ?? this.messagingServiceSid;
+    // phoneNumber-first matches the adapter's pre-RCS behavior so openDM()
+    // keeps producing the same thread ids for existing deployments that
+    // configure both a phone number and a messaging service.
+    const sender =
+      this.phoneNumber ??
+      this.messagingServiceSid ??
+      (this.rcsSenderId ? normalizeRcsSenderId(this.rcsSenderId) : undefined);
     if (!sender) {
       throw new ValidationError(
         "twilio",
-        "phoneNumber or messagingServiceSid is required"
+        "phoneNumber, messagingServiceSid, or rcsSenderId is required"
       );
     }
     return sender;
+  }
+
+  protected inboundThreadSender(payload: {
+    channelMetadata?: import("./channel").TwilioChannelMetadata;
+    messagingServiceSid?: string;
+    to: string;
+  }): string {
+    return resolveInboundThreadSender({
+      channelMetadata: payload.channelMetadata,
+      messagingServiceSid: payload.messagingServiceSid,
+      messagingServiceSidConfig: this.messagingServiceSid,
+      rcsSenderIdConfig: this.rcsSenderId,
+      to: payload.to,
+    });
   }
 
   protected author(userId: string, isMe: boolean): Message["author"] {
@@ -457,6 +621,8 @@ export function createTwilioAdapter(
   return new TwilioAdapter(config);
 }
 
+const HTTP_URL_PATTERN = /^https?:\/\//;
+
 function isTwilioWebhookPayload(
   raw: TwilioRawMessage
 ): raw is TwilioWebhookPayload {
@@ -468,7 +634,21 @@ function dateFromTwilio(value: string | null | undefined): Date {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 }
 
-export { cardToTwilioText } from "./cards";
+export type { TwilioContentBody, TwilioRcsContentResult } from "./cards";
+export {
+  cardToTwilioRcs,
+  cardToTwilioText,
+  decodeTwilioCallbackData,
+  encodeTwilioCallbackData,
+} from "./cards";
+export type { TwilioChannel, TwilioChannelMetadata } from "./channel";
+export {
+  inferTwilioChannel,
+  isRcsAddress,
+  isRcsCapableSender,
+  normalizeRcsSenderId,
+  resolveInboundThreadSender,
+} from "./channel";
 export { TwilioFormatConverter } from "./markdown";
 export type {
   TwilioAdapterConfig,
