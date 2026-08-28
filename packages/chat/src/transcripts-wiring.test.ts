@@ -9,16 +9,30 @@ import {
 } from "./mock-adapter";
 import type { Adapter, StateAdapter } from "./types";
 
-const TRANSCRIPTS_NOT_CONFIGURED_RE = /chat\.transcripts is not configured/;
-const IDENTITY_REQUIRED_RE = /requires ChatConfig\.identity/;
+const USER_HISTORY_NOT_CONFIGURED_RE =
+  /chat\.history\.user is not configured|chat\.transcripts is not configured/;
+const IDENTITY_REQUIRED_RE = /identity resolver|requires ChatConfig\.identity/;
 
-describe("Chat — Transcripts API wiring", () => {
+describe("Chat — History API wiring", () => {
   let mockAdapter: Adapter;
   let mockState: StateAdapter;
 
   beforeEach(() => {
     mockAdapter = createMockAdapter("slack");
     mockState = createMockState();
+  });
+
+  it("throws at construction when history.user is set without identity", () => {
+    expect(
+      () =>
+        new Chat({
+          userName: "testbot",
+          adapters: { slack: mockAdapter },
+          state: mockState,
+          logger: mockLogger,
+          history: { user: { maxPerUser: 200 } },
+        })
+    ).toThrow(IDENTITY_REQUIRED_RE);
   });
 
   it("throws at construction when transcripts is set without identity", () => {
@@ -59,7 +73,7 @@ describe("Chat — Transcripts API wiring", () => {
     ).not.toThrow();
   });
 
-  it("chat.transcripts getter throws when transcripts was not configured", () => {
+  it("chat.history.user getter throws when user history was not configured", () => {
     const chat = new Chat({
       userName: "testbot",
       adapters: { slack: mockAdapter },
@@ -67,7 +81,65 @@ describe("Chat — Transcripts API wiring", () => {
       logger: mockLogger,
     });
 
-    expect(() => chat.transcripts).toThrow(TRANSCRIPTS_NOT_CONFIGURED_RE);
+    expect(() => chat.history.user).toThrow(USER_HISTORY_NOT_CONFIGURED_RE);
+  });
+
+  it("chat.transcripts getter throws when user history was not configured", () => {
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slack: mockAdapter },
+      state: mockState,
+      logger: mockLogger,
+    });
+
+    expect(() => chat.transcripts).toThrow(USER_HISTORY_NOT_CONFIGURED_RE);
+  });
+
+  it("chat.history.user returns the API instance when configured via history.user", () => {
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slack: mockAdapter },
+      state: mockState,
+      logger: mockLogger,
+      history: {
+        user: {
+          identity: () => "u1",
+        },
+      },
+    });
+
+    const api = chat.history.user;
+    expect(api).toBeDefined();
+    expect(typeof api.append).toBe("function");
+    expect(chat.transcripts).toBe(api);
+  });
+
+  it("merges legacy transcripts settings under history.user during migration", async () => {
+    // A config migrating one field at a time: identity moved to history.user,
+    // retention/maxPerUser still on the legacy transcripts block. Both must
+    // apply — the legacy settings must not be silently dropped.
+    const chat = new Chat({
+      userName: "testbot",
+      adapters: { slack: mockAdapter },
+      state: mockState,
+      logger: mockLogger,
+      history: { user: { identity: () => "u1" } },
+      transcripts: { maxPerUser: 50, retention: "30d" },
+    });
+
+    const msg = createTestMessage("m1", "hello");
+    msg.userKey = "u1";
+    await chat.history.user.append(
+      { adapter: mockAdapter, id: "slack:C123:1.2" } as never,
+      msg
+    );
+
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    expect(mockState.appendToList).toHaveBeenCalledWith(
+      expect.stringContaining("u1"),
+      expect.objectContaining({ userKey: "u1" }),
+      { maxLength: 50, ttlMs: thirtyDaysMs }
+    );
   });
 
   it("chat.transcripts returns the API instance when configured", () => {

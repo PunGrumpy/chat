@@ -16,6 +16,7 @@ import {
   Fields,
   LinkButton,
   Modal,
+  type PromptEntry,
   RadioSelect,
   Section,
   Select,
@@ -23,7 +24,7 @@ import {
   Table,
   CardText as Text,
   TextInput,
-  type TranscriptEntry,
+  toPromptEntries,
 } from "chat";
 import { type AiMessage, createChatTools, toAiMessages } from "chat/ai";
 import { start } from "workflow/api";
@@ -81,15 +82,16 @@ export const bot = new Chat<typeof adapters, ThreadState>({
   state,
   logger: "debug",
 
-  // Hardcoded for testing — see `TEST_USER_KEY` above.
-  identity: () => TEST_USER_KEY,
-
-  // Persist a per-user transcript across every adapter the user talks
+  // Persist a per-user history across every adapter the user talks
   // through. Used below to backfill conversation context for platforms
   // that don't expose server-side message history.
-  transcripts: {
-    retention: "30d",
-    maxPerUser: 100,
+  // identity is hardcoded for testing — see `TEST_USER_KEY` above.
+  history: {
+    user: {
+      identity: () => TEST_USER_KEY,
+      retention: "30d",
+      maxPerUser: 100,
+    },
   },
 });
 
@@ -99,14 +101,6 @@ const agent = new ToolLoopAgent({
   instructions:
     "You are a helpful assistant in a chat thread. Answer the user's queries in a concise manner.",
 });
-
-// Map transcript entries to AI SDK chat-message shape.
-function transcriptToAiMessages(entries: TranscriptEntry[]): AiMessage[] {
-  return entries.map((entry) => ({
-    role: entry.role === "assistant" ? "assistant" : "user",
-    content: entry.text,
-  }));
-}
 
 type MentionHandler = Parameters<typeof bot.onNewMention>[0];
 type MentionThread = Parameters<MentionHandler>[0];
@@ -233,6 +227,8 @@ bot.onNewMention(async (thread, message) => {
         <Button id="clear-transcripts" style="danger">
           Clear Transcripts
         </Button>
+        <Button id="thread-history">Thread History</Button>
+        <Button id="channel-history">Channel History</Button>
         <Button id="channel-post">Channel Post</Button>
         <Button id="channel-info">Channel Info (Slack)</Button>
         <Button id="pin-message">Pin Message (Slack)</Button>
@@ -300,11 +296,11 @@ bot.onDirectMessage(async (thread, message, channel) => {
   // so it can't give the model both sides of the conversation. The transcript
   // records user and assistant turns across thread IDs, which also survives
   // agent_view's one-thread-per-message model.
-  await bot.transcripts.append(thread, message);
-  let history: AiMessage[] = [];
+  await bot.history.user.append(thread, message);
+  let history: (AiMessage | PromptEntry)[] = [];
   if (message.userKey) {
-    history = transcriptToAiMessages(
-      await bot.transcripts.list({ userKey: message.userKey, limit: 20 })
+    history = toPromptEntries(
+      await bot.history.user.list({ userKey: message.userKey, limit: 20 })
     );
   }
   if (history.length === 0) {
@@ -319,7 +315,7 @@ bot.onDirectMessage(async (thread, message, channel) => {
     await thread.post(result.fullStream);
     // Persist the assistant reply so the next turn sees both sides.
     if (message.userKey) {
-      await bot.transcripts.append(
+      await bot.history.user.append(
         thread,
         { role: "assistant", text: await result.text },
         { userKey: message.userKey }
@@ -974,12 +970,12 @@ bot.onModalClose("feedback_form", (event) => {
   console.log(`${event.user.userName} cancelled the feedback form`);
 });
 
-// Demonstrate bot.transcripts.list / count / delete
+// Demonstrate bot.history.user.list / count / delete
 bot.onAction("transcripts", async (event) => {
   if (!event.thread) {
     return;
   }
-  const entries = await bot.transcripts.list({
+  const entries = await bot.history.user.list({
     userKey: TEST_USER_KEY,
     limit: 50,
   });
@@ -1020,12 +1016,131 @@ bot.onAction("clear-transcripts", async (event) => {
   if (!event.thread) {
     return;
   }
-  const { deleted } = await bot.transcripts.delete({
+  const { deleted } = await bot.history.user.delete({
     userKey: TEST_USER_KEY,
   });
   await event.thread.post(
     <Card title={`${emoji.check} Transcripts cleared`}>
       <Text>{`Removed ${deleted} entr${deleted === 1 ? "y" : "ies"} for \`${TEST_USER_KEY}\`.`}</Text>
+    </Card>
+  );
+});
+
+// Demonstrate bot.history.thread.list / collect
+bot.onAction("thread-history", async (event) => {
+  if (!event.thread) {
+    return;
+  }
+  const { thread } = event;
+  const preview = (text: string, n = 40) => {
+    if (!text.trim()) {
+      return "[Card]";
+    }
+    return text.length > n ? `${text.slice(0, n)}…` : text;
+  };
+
+  try {
+    // One page of the most recent messages (backward is the default)
+    const recent = await bot.history.thread.list(thread.id, { limit: 5 });
+
+    // collect() paginates for you, oldest first
+    const oldest: string[] = [];
+    for await (const msg of bot.history.thread.collect(thread.id, {
+      limit: 5,
+    })) {
+      oldest.push(preview(msg.text));
+    }
+
+    await thread.post(
+      <Card title={`${emoji.memo} bot.history.thread`}>
+        <Text>{`**list({ limit: 5 })** — newest ${recent.messages.length}`}</Text>
+        <Text>
+          {recent.messages.map((m) => preview(m.text)).join("\n") ||
+            "(no messages)"}
+        </Text>
+        <Text>{`nextCursor: ${recent.nextCursor ?? "none"}`}</Text>
+        <Divider />
+        <Text>{`**collect({ limit: 5 })** — oldest ${oldest.length}`}</Text>
+        <Text>{oldest.join("\n") || "(no messages)"}</Text>
+      </Card>
+    );
+  } catch (err) {
+    await thread.post(
+      `${emoji.warning} history.thread failed: ${
+        err instanceof Error ? err.message : "Unknown error"
+      }`
+    );
+  }
+});
+
+// Demonstrate bot.history.channel.listMessages / listThreads /
+// listThreadsWithMessages. Methods throw on adapters that lack the
+// underlying capability, so each call reports its own outcome.
+bot.onAction("channel-history", async (event) => {
+  if (!event.thread) {
+    return;
+  }
+  const { thread } = event;
+  const channelId = thread.adapter.channelIdFromThreadId(thread.id);
+  const preview = (text: string, n = 40) => {
+    if (!text.trim()) {
+      return "[Card]";
+    }
+    return text.length > n ? `${text.slice(0, n)}…` : text;
+  };
+  const errorText = (err: unknown) =>
+    `${emoji.warning} ${err instanceof Error ? err.message : "Unknown error"}`;
+
+  let messagesText: string;
+  try {
+    const { messages } = await bot.history.channel.listMessages(channelId, {
+      limit: 5,
+    });
+    messagesText =
+      messages.map((m) => preview(m.text)).join("\n") || "(no messages)";
+  } catch (err) {
+    messagesText = errorText(err);
+  }
+
+  let threadsText: string;
+  try {
+    const { threads } = await bot.history.channel.listThreads(channelId, {
+      limit: 3,
+    });
+    threadsText =
+      threads
+        .map(
+          (t) => `${preview(t.rootMessage.text)} (${t.replyCount ?? 0} replies)`
+        )
+        .join("\n") || "(no threads)";
+  } catch (err) {
+    threadsText = errorText(err);
+  }
+
+  let drillDownText: string;
+  try {
+    const { threads } = await bot.history.channel.listThreadsWithMessages(
+      channelId,
+      { maxThreads: 2, messagesPerThread: 3 }
+    );
+    drillDownText =
+      threads
+        .map((t) => `${t.threadId}: ${t.messages.length} messages`)
+        .join("\n") || "(no threads)";
+  } catch (err) {
+    drillDownText = errorText(err);
+  }
+
+  await thread.post(
+    <Card subtitle={channelId} title={`${emoji.memo} bot.history.channel`}>
+      <Text>{"**listMessages({ limit: 5 })**"}</Text>
+      <Text>{messagesText}</Text>
+      <Divider />
+      <Text>{"**listThreads({ limit: 3 })**"}</Text>
+      <Text>{threadsText}</Text>
+      <Divider />
+      <Text>{"**listThreadsWithMessages({ maxThreads: 2 })**"}</Text>
+      <Text>{drillDownText}</Text>
     </Card>
   );
 });
@@ -1342,31 +1457,31 @@ bot.onSubscribedMessage(async (thread, message) => {
 
   // If AI mode is enabled (or this is a DM), use the AI agent
   if (threadState?.aiMode) {
-    // Capture the user's message in their cross-platform transcript so we can
-    // backfill context on platforms without server-side history.
-    await bot.transcripts.append(thread, message);
+    // Capture the user's message in their cross-platform history so we can
+    // backfill context on platforms without server-side message history.
+    await bot.history.user.append(thread, message);
 
-    // Build conversation history: try fetchMessages first, then fall back to
-    // the user's stored transcript (filtered to this thread) for platforms
-    // without a message history API.
-    let history: AiMessage[];
+    // Build conversation history: bot.history.thread.list serves platform
+    // history where available (and the SDK-side cache on adapters that
+    // persist there), with the user's stored history as a last resort.
+    let history: (AiMessage | PromptEntry)[];
     try {
-      const result = await thread.adapter.fetchMessages(thread.id, {
+      const result = await bot.history.thread.list(thread.id, {
         limit: 20,
       });
       history =
         result.messages.length > 0
           ? await toAiMessages(result.messages)
-          : transcriptToAiMessages(
-              await bot.transcripts.list({
+          : toPromptEntries(
+              await bot.history.user.list({
                 userKey: message.userKey ?? "",
                 threadId: thread.id,
                 limit: 20,
               })
             );
     } catch {
-      history = transcriptToAiMessages(
-        await bot.transcripts.list({
+      history = toPromptEntries(
+        await bot.history.user.list({
           userKey: message.userKey ?? "",
           threadId: thread.id,
           limit: 20,
@@ -1385,9 +1500,9 @@ bot.onSubscribedMessage(async (thread, message) => {
       await thread.post(result.fullStream);
       const responseText = await result.text;
       // Persist the assistant reply alongside the user message, so the next
-      // turn can read both sides of the conversation from the transcript.
+      // turn can read both sides of the conversation from the history.
       if (message.userKey) {
-        await bot.transcripts.append(
+        await bot.history.user.append(
           thread,
           { role: "assistant", text: responseText },
           { userKey: message.userKey }

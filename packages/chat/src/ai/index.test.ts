@@ -12,9 +12,9 @@ import { createChatTools } from "./index";
 import type { ToolOverrides } from "./types";
 
 const REQUIRES_CHAT_INSTANCE_REGEX = /requires a `chat` instance/;
+const NO_LIST_THREADS_REGEX = /does not implement listThreads/;
 const NO_FETCH_CHANNEL_MESSAGES_REGEX =
   /does not support fetching channel messages/;
-const NO_LIST_THREADS_REGEX = /does not support listing threads/;
 const OUT_OF_SCOPE_REGEX = /tools are scoped to/;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -981,13 +981,15 @@ describe("createChatTools", () => {
   it("fetchChannelMessages throws when the adapter does not support it", async () => {
     (mockAdapter as { fetchChannelMessages?: unknown }).fetchChannelMessages =
       undefined;
+
     const tools = createChatTools({ chat });
     await expect(
       tools.fetchChannelMessages?.execute?.(
-        { channelId: "slack:C123" },
+        { channelId: "slack:C123", limit: 5, direction: "backward" },
         TOOL_OPTIONS
       )
     ).rejects.toThrow(NO_FETCH_CHANNEL_MESSAGES_REGEX);
+    expect(mockAdapter.fetchMessages).not.toHaveBeenCalled();
   });
 
   it("fetchThread returns a flattened ThreadInfo", async () => {
