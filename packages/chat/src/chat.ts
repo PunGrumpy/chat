@@ -81,8 +81,17 @@ import type {
 import { ChatError, ConsoleLogger, LockError } from "./types";
 
 const DEFAULT_LOCK_TTL_MS = 30_000; // 30 seconds
+const DEFAULT_MAX_LOCK_LIFETIME_MS = 600_000; // 10 minutes
 const ACTIVE_TURN_TTL_MS = 60 * 60 * 1000; // 1 hour
 const ABORT_POLL_INTERVAL_MS = 250;
+
+/** Handle returned by startLockHeartbeat for the duration of a held lock. */
+interface LockHeartbeat {
+  /** True once this instance can no longer assume it still owns the lock. */
+  isOwnershipLost: () => boolean;
+  /** Stop renewing. Waits for any in-flight extend so it cannot land after release. */
+  stop: () => Promise<void>;
+}
 
 /** Promise-based sleep for debounce timing. */
 function sleep(ms: number): Promise<void> {
@@ -352,6 +361,7 @@ export class Chat<
         this._concurrencyConfig = {
           debounceMs: 1500,
           maxConcurrent: Number.POSITIVE_INFINITY,
+          maxLockLifetimeMs: DEFAULT_MAX_LOCK_LIFETIME_MS,
           maxQueueSize: 10,
           onQueueFull: "drop-oldest",
           queueEntryTtlMs: 90_000,
@@ -377,6 +387,8 @@ export class Chat<
         this._concurrencyConfig = {
           debounceMs: concurrency.debounceMs ?? 1500,
           maxConcurrent: concurrency.maxConcurrent ?? Number.POSITIVE_INFINITY,
+          maxLockLifetimeMs:
+            concurrency.maxLockLifetimeMs ?? DEFAULT_MAX_LOCK_LIFETIME_MS,
           maxQueueSize: concurrency.maxQueueSize ?? 10,
           onQueueFull: concurrency.onQueueFull ?? "drop-oldest",
           queueEntryTtlMs: concurrency.queueEntryTtlMs ?? 90_000,
@@ -387,6 +399,7 @@ export class Chat<
       this._concurrencyConfig = {
         debounceMs: 1500,
         maxConcurrent: Number.POSITIVE_INFINITY,
+        maxLockLifetimeMs: DEFAULT_MAX_LOCK_LIFETIME_MS,
         maxQueueSize: 10,
         onQueueFull: "drop-oldest",
         queueEntryTtlMs: 90_000,
@@ -2456,12 +2469,9 @@ export class Chat<
       token: lock.token,
     });
 
-    try {
-      await this.dispatchToHandlers(adapter, threadId, message);
-    } finally {
-      await this._stateAdapter.releaseLock(lock);
-      this.logger.debug("Lock released", { threadId, lockKey });
-    }
+    await this.withHeldLock(lock, threadId, lockKey, () =>
+      this.dispatchToHandlers(adapter, threadId, message)
+    );
   }
 
   /**
@@ -2531,7 +2541,7 @@ export class Chat<
       token: lock.token,
     });
 
-    try {
+    await this.withHeldLock(lock, threadId, lockKey, async (heartbeat) => {
       if (strategy === "debounce") {
         // Debounce: enqueue our own message and enter the debounce loop
         await this._stateAdapter.enqueue(
@@ -2549,7 +2559,7 @@ export class Chat<
           messageId: message.id,
           debounceMs,
         });
-        await this.debounceLoop(lock, adapter, lockKey);
+        await this.debounceLoop(heartbeat, adapter, lockKey);
       } else if (strategy === "burst") {
         await this._stateAdapter.enqueue(
           lockKey,
@@ -2567,17 +2577,125 @@ export class Chat<
           debounceMs,
         });
         await sleep(debounceMs);
-        await this._stateAdapter.extendLock(lock, DEFAULT_LOCK_TTL_MS);
-        await this.drainQueue(lock, adapter, lockKey);
+        await this.drainQueue(heartbeat, adapter, lockKey);
       } else {
         // Queue: process our message immediately, then drain any queued messages
         await this.dispatchToHandlers(adapter, threadId, message);
-        await this.drainQueue(lock, adapter, lockKey);
+        await this.drainQueue(heartbeat, adapter, lockKey);
       }
+    });
+  }
+
+  /**
+   * Run `fn` while keeping `lock` alive with a renewal heartbeat, then stop
+   * the heartbeat and release the lock. Every lock-holding path must go
+   * through this so acquiring a lock is never paired with a missing
+   * heartbeat.
+   */
+  private async withHeldLock(
+    lock: Lock,
+    threadId: string,
+    lockKey: string,
+    fn: (heartbeat: LockHeartbeat) => Promise<void>
+  ): Promise<void> {
+    const heartbeat = this.startLockHeartbeat(lock);
+    try {
+      await fn(heartbeat);
     } finally {
+      await heartbeat.stop();
       await this._stateAdapter.releaseLock(lock);
       this.logger.debug("Lock released", { threadId, lockKey });
     }
+  }
+
+  private startLockHeartbeat(lock: Lock): LockHeartbeat {
+    const { maxLockLifetimeMs } = this._concurrencyConfig;
+    const startedAt = Date.now();
+    let stopped = false;
+    let ownershipLost = false;
+    let inFlight: Promise<void> | undefined;
+    // Latest instant we know the lock is still ours; refreshed on each
+    // successful extend. Once it passes, the lock has lapsed on the backend.
+    let heldUntil = lock.expiresAt;
+
+    const heartbeat = setInterval(() => {
+      if (inFlight) {
+        // The previous extend is still in flight (degraded backend) —
+        // don't stack concurrent calls onto it.
+        return;
+      }
+      if (Date.now() - startedAt >= maxLockLifetimeMs) {
+        // Renewal cap: let the lock lapse at its TTL so a hung handler
+        // can't block the thread forever.
+        clearInterval(heartbeat);
+        this.logger.warn(
+          "Lock heartbeat reached maxLockLifetimeMs — the lock will lapse at its TTL",
+          {
+            threadId: lock.threadId,
+            token: lock.token,
+            maxLockLifetimeMs,
+          }
+        );
+        return;
+      }
+      inFlight = this._stateAdapter
+        .extendLock(lock, DEFAULT_LOCK_TTL_MS)
+        .then((extended) => {
+          if (extended) {
+            heldUntil = Date.now() + DEFAULT_LOCK_TTL_MS;
+            return;
+          }
+          ownershipLost = true;
+          clearInterval(heartbeat);
+          if (!stopped) {
+            this.logger.warn(
+              "Lock heartbeat stopped after ownership was lost",
+              {
+                threadId: lock.threadId,
+                token: lock.token,
+              }
+            );
+          }
+        })
+        .catch((error) => {
+          if (stopped) {
+            return;
+          }
+          if (Date.now() >= heldUntil) {
+            ownershipLost = true;
+            clearInterval(heartbeat);
+            this.logger.warn(
+              "Lock lapsed while the heartbeat could not reach the state backend",
+              {
+                error,
+                threadId: lock.threadId,
+                token: lock.token,
+              }
+            );
+          } else {
+            this.logger.warn("Lock heartbeat failed", {
+              error,
+              threadId: lock.threadId,
+              token: lock.token,
+            });
+          }
+        })
+        .finally(() => {
+          inFlight = undefined;
+        });
+    }, DEFAULT_LOCK_TTL_MS / 3);
+    // Don't pin the process for a hung handler nothing else is waiting on —
+    // on exit the lock lapses at its TTL and another instance takes over.
+    heartbeat.unref?.();
+
+    return {
+      isOwnershipLost: () => ownershipLost || Date.now() >= heldUntil,
+      stop: async () => {
+        stopped = true;
+        clearInterval(heartbeat);
+        await inFlight;
+      },
+    };
   }
 
   /**
@@ -2585,7 +2703,7 @@ export class Chat<
    * repeat until no new messages, then process the final message.
    */
   private async debounceLoop(
-    lock: Lock,
+    heartbeat: LockHeartbeat,
     adapter: Adapter,
     lockKey: string
   ): Promise<void> {
@@ -2594,7 +2712,14 @@ export class Chat<
 
     while (true) {
       await sleep(debounceMs);
-      await this._stateAdapter.extendLock(lock, DEFAULT_LOCK_TTL_MS);
+      if (heartbeat.isOwnershipLost()) {
+        // Another instance may hold the lock now — leave the queue to it.
+        this.logger.warn(
+          "Stopping debounce loop after lock ownership was lost",
+          { lockKey }
+        );
+        return;
+      }
 
       // Atomically take pending messages
       const pending: Array<{ message: Message; expiresAt: number }> = [];
@@ -2652,7 +2777,9 @@ export class Chat<
         skipped: messageSkipped,
         totalSinceLastHandler: messageSkipped.length + 1,
       });
-      break;
+      skipped.length = 0;
+      // Loop again: a message enqueued while the handler ran must be
+      // debounced and processed, not stranded until the next webhook.
     }
   }
 
@@ -2661,11 +2788,19 @@ export class Chat<
    * skipped context, then check for more.
    */
   private async drainQueue(
-    lock: Lock,
+    heartbeat: LockHeartbeat,
     adapter: Adapter,
     lockKey: string
   ): Promise<void> {
     while (true) {
+      if (heartbeat.isOwnershipLost()) {
+        // Another instance may hold the lock now — leave the queue to it.
+        this.logger.warn("Stopping queue drain after lock ownership was lost", {
+          lockKey,
+        });
+        return;
+      }
+
       // Collect all pending messages, rehydrating after JSON roundtrip
       const pending: Array<{ message: Message; expiresAt: number }> = [];
       while (true) {
@@ -2688,8 +2823,6 @@ export class Chat<
       if (pending.length === 0) {
         return;
       }
-
-      await this._stateAdapter.extendLock(lock, DEFAULT_LOCK_TTL_MS);
 
       // Latest message is the one we process
       const latest = pending.at(-1);
