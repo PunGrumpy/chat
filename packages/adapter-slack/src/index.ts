@@ -761,6 +761,10 @@ export interface SlackEvent {
   /** Rich text blocks containing structured elements (links, mentions, etc.) */
   blocks?: SlackMessageBlock[];
   bot_id?: string;
+  bot_profile?: {
+    id?: string;
+    user_id?: string;
+  };
   channel?: string;
   /** Channel type: "channel", "group", "mpim", or "im" (DM) */
   channel_type?: string;
@@ -796,6 +800,12 @@ export interface SlackEvent {
   type: string;
   user?: string;
   username?: string;
+}
+
+function isSlackBotMessage(event: SlackEvent): boolean {
+  return Boolean(
+    event.bot_id || event.bot_profile?.id || event.subtype === "bot_message"
+  );
 }
 
 /** Slack reaction event payload */
@@ -4158,6 +4168,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
     options?: { skipSelfMention?: boolean }
   ): Promise<Message<unknown>> {
     const isMe = this.isMessageFromSelf(event);
+    let isBot = isSlackBotMessage(event) || isMe;
     const skipSelfMention = options?.skipSelfMention ?? true;
 
     const rawText = event.text || "";
@@ -4174,6 +4185,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
       userName = userInfo?.displayName ?? event.user;
       fullName = userInfo?.realName ?? userName;
       email = userInfo?.email;
+      isBot ||= userInfo?.isBot ?? false;
     }
 
     // Track thread participants for outgoing mention resolution (skip dupes)
@@ -4213,7 +4225,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         userName,
         fullName,
         email,
-        isBot: !!event.bot_id,
+        isBot,
         isSystem: event.user === SLACK_SYSTEM_USER_ID,
         isMe,
       },
@@ -6179,7 +6191,7 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
         userId: event.user || event.bot_id || "unknown",
         userName,
         fullName,
-        isBot: !!event.bot_id,
+        isBot: isSlackBotMessage(event) || isMe,
         isSystem: event.user === SLACK_SYSTEM_USER_ID,
         isMe,
       },
@@ -6725,19 +6737,22 @@ export class SlackAdapter implements Adapter<SlackThreadId, unknown> {
    * - _botId is the bot ID (B_xxx) - matches event.bot_id
    */
   protected isMessageFromSelf(event: SlackEvent): boolean {
+    const userId = event.user ?? event.bot_profile?.user_id;
+    const botId = event.bot_id ?? event.bot_profile?.id;
+
     // Check request context first (multi-workspace)
     const ctx = this.requestContext.getStore();
-    if (ctx?.botUserId && event.user === ctx.botUserId) {
+    if (ctx?.botUserId && userId === ctx.botUserId) {
       return true;
     }
 
     // Primary check: user ID match (for messages sent as the bot user)
-    if (this._botUserId && event.user === this._botUserId) {
+    if (this._botUserId && userId === this._botUserId) {
       return true;
     }
 
     // Secondary check: bot ID match (for bot_message subtypes)
-    if (this._botId && event.bot_id === this._botId) {
+    if (this._botId && botId === this._botId) {
       return true;
     }
 

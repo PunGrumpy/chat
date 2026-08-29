@@ -9184,6 +9184,69 @@ describe("reverse user lookup", () => {
         isMe: false,
       });
     });
+
+    it("marks app messages with a bot profile as bots", async () => {
+      const { adapter } = createAdapterWithState();
+
+      const message = (await (
+        adapter as unknown as {
+          parseSlackMessage(
+            event: Record<string, unknown>,
+            threadId: string
+          ): Promise<{ author: Record<string, unknown> }>;
+        }
+      ).parseSlackMessage(
+        {
+          type: "message",
+          user: "U_OTHER_BOT",
+          username: "other-bot",
+          channel: "C123",
+          text: "Automated update",
+          ts: "1234567890.123456",
+          bot_profile: { id: "B_OTHER_BOT", user_id: "U_OTHER_BOT" },
+        },
+        "slack:C123:1234567890.123456"
+      )) as { author: Record<string, unknown> };
+
+      expect(message.author).toMatchObject({
+        userId: "U_OTHER_BOT",
+        isBot: true,
+        isMe: false,
+      });
+    });
+
+    it("marks the configured bot as a bot without Slack bot metadata", async () => {
+      const adapter = createSlackAdapter({
+        botToken: "xoxb-test-token",
+        botUserId: "U_BOT",
+        signingSecret: secret,
+        logger: mockLogger,
+      });
+      await adapter.initialize(
+        createMockChatInstance({ state: createMockState() })
+      );
+
+      const message = (await (
+        adapter as unknown as {
+          parseSlackMessage(
+            event: Record<string, unknown>,
+            threadId: string
+          ): Promise<{ author: Record<string, unknown> }>;
+        }
+      ).parseSlackMessage(
+        {
+          type: "message",
+          user: "U_BOT",
+          username: "agent",
+          channel: "C123",
+          text: "Automated update",
+          ts: "1234567890.123456",
+        },
+        "slack:C123:1234567890.123456"
+      )) as { author: Record<string, unknown> };
+
+      expect(message.author).toMatchObject({ isBot: true, isMe: true });
+    });
   });
 
   describe("incoming author email", () => {
