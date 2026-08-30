@@ -240,6 +240,7 @@ export const VALID_DOC_PACKAGES = [
   "chat-adapter-sendblue",
   "@bitbasti/chat-adapter-webex",
   "chat-adapter-zalo",
+  "chat-adapter-line",
   "@larksuite/vercel-chat-adapter",
   "chat-adapter-weixin",
   "@agentor/chat-qq",
