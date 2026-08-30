@@ -3,6 +3,7 @@
   "pages": [
     "---Platforms---",
     "webex",
+    "line",
     "baileys",
     "blooio",
     "zalo",

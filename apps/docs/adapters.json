@@ -452,5 +452,15 @@
     "packageName": "chat-adapter-weixin",
     "author": "wong2",
     "readme": "https://github.com/wong2/weixin-chat-adapter"
+  },
+  {
+    "name": "LINE",
+    "slug": "line",
+    "type": "platform",
+    "community": true,
+    "description": "Community LINE Messaging API adapter for Chat SDK with Flex Message cards, inbound media, action postbacks, and typing indicators.",
+    "packageName": "chat-adapter-line",
+    "author": "PunGrumpy",
+    "readme": "https://github.com/PunGrumpy/chat-adapter-line"
   }
 ]
